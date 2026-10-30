@@ -419,8 +419,12 @@ class UploadForm : Form
         // which is unset outside Git Bash.
         if (gitSsh && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("HOME")))
             psi.EnvironmentVariables["HOME"] = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        var proc = Process.Start(psi);
-        lock (live) { live.RemoveAll(p => p.HasExited); live.Add(proc); }
+        // Dropped from `live` when it exits (not by asking HasExited, which
+        // throws once the process object is disposed).
+        var proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
+        proc.Exited += delegate { lock (live) live.Remove(proc); };
+        lock (live) live.Add(proc);
+        proc.Start();
         proc.ErrorDataReceived += (s, e) => { if (e.Data != null) lock (stderr) stderr.AppendLine(e.Data); };
         proc.OutputDataReceived += (s, e) => { };
         proc.BeginErrorReadLine();
