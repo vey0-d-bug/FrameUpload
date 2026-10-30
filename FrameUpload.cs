@@ -72,6 +72,8 @@ class UploadForm : Form
     readonly Queue<string> queue = new Queue<string>();
     readonly object queueLock = new object();
     bool busy;
+    volatile string currentPart;   // the .part being written, for a quit mid-copy
+    readonly List<Process> live = new List<Process>();
     int doneCount, failCount;
     long batchBytes, batchSent;
 
@@ -138,6 +140,7 @@ class UploadForm : Form
                 MessageBox.Show(this, "An upload is still running. Quit anyway?", Text,
                     MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
                 e.Cancel = true;
+            else if (busy) StopAndCleanUp();
         };
     }
 
@@ -247,8 +250,9 @@ class UploadForm : Form
         string part = dir + "/" + Sh("." + name + ".part");
         string final = dir + "/" + Sh(name);
         long size = new FileInfo(path).Length;
+        currentPart = part;
 
-        int n = size < ParallelMin ? 1 : (int)Math.Max(1, Math.Min(streams, size / RangeMin));
+        int n =size < ParallelMin ? 1 : (int)Math.Max(1, Math.Min(streams, size / RangeMin));
         used = n;
         if (n == 1)
             return Transfer(path, name, size, new[] { new Range(0, size,
@@ -416,11 +420,32 @@ class UploadForm : Form
         if (gitSsh && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("HOME")))
             psi.EnvironmentVariables["HOME"] = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         var proc = Process.Start(psi);
+        lock (live) { live.RemoveAll(p => p.HasExited); live.Add(proc); }
         proc.ErrorDataReceived += (s, e) => { if (e.Data != null) lock (stderr) stderr.AppendLine(e.Data); };
         proc.OutputDataReceived += (s, e) => { };
         proc.BeginErrorReadLine();
         proc.BeginOutputReadLine();
         return proc;
+    }
+
+    // Quit mid-copy: stops the ssh processes and removes the half-written
+    // .part from the headset (it is hidden, but it takes space).
+    void StopAndCleanUp()
+    {
+        lock (queueLock) queue.Clear();
+        lock (live) { foreach (var p in live) Kill(p); live.Clear(); }
+        string part = currentPart;
+        if (part == null) return;
+        try
+        {
+            var stderr = new StringBuilder();
+            using (var proc = StartSsh("rm -f " + part, stderr))
+            {
+                proc.StandardInput.Close();
+                proc.WaitForExit(5000);
+            }
+        }
+        catch (Exception) { } // best effort: quitting anyway
     }
 
     static void Kill(Process p)
