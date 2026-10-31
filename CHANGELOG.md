@@ -1,5 +1,13 @@
 # FrameUpload patch notes
 
+## v5 (2026-10-31)
+
+- **Rename...** (or F2) in the headset view renames the selected file or folder. The box starts with the name selected up to its extension, and the item stays selected after the view refreshes.
+- A name that is already taken is refused (a folder of that name too), so nothing is overwritten or moved into another folder.
+- Changing or dropping a file's extension asks first, since FrameCinema goes by the extension. Names can't contain / or \, start with a dot (that would hide the item), or exceed 255 bytes.
+- Folders can't be renamed while copies are under way.
+- The window's minimum width grew a little to fit the extra button.
+
 ## v4 (2026-10-31)
 
 - Click a column header in the headset view to sort by name, size or date; click it again to flip the order. Size and date start biggest/newest first. Folders stay above files.

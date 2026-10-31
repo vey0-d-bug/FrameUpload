@@ -83,6 +83,7 @@ class UploadForm : Form
     readonly Button refreshButton = new Button();
     readonly Button newFolderButton = new Button();
     readonly Button deleteButton = new Button();
+    readonly Button renameButton = new Button();
     readonly Label remoteInfo = new Label();
     readonly ToolTip tips = new ToolTip();
     // The HostName that connected, passed to ssh as -o HostName= so the
@@ -91,6 +92,7 @@ class UploadForm : Form
     int connecting;      // 1 while a connect runs
     int listSeq;         // drops listings that a newer one overtook
     string listedSub;    // the folder the view shows
+    string selectAfter;  // a name to select once the next listing shows
     readonly Queue<string> queue = new Queue<string>();
     readonly object queueLock = new object();
     bool busy;
@@ -112,7 +114,7 @@ class UploadForm : Form
         if (o.Files.Count > 0) Shown += delegate { Enqueue(o.Files.ToArray()); };
         Text = "Frame Upload";
         ClientSize = new Size(640, 640);
-        MinimumSize = new Size(520, 480);
+        MinimumSize = new Size(600, 480);
         AllowDrop = true;
         Font = new Font("Segoe UI", 9f);
 
@@ -133,13 +135,13 @@ class UploadForm : Form
         // The folder the view shows is the one files are copied to.
         var dest = new Label { Text = "Copy to  ~/Videos/", AutoSize = true, Location = new Point(12, 53) };
         subfolder.Location = new Point(118, 50);
-        subfolder.Width = 230;
+        subfolder.Width = 144;
         subfolder.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         subfolder.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; ListFolder(); } };
         var x = 628;
-        foreach (var b in new[] { deleteButton, newFolderButton, refreshButton, upButton })
+        foreach (var b in new[] { deleteButton, renameButton, newFolderButton, refreshButton, upButton })
         {
-            b.Size = new Size(b == newFolderButton ? 84 : 64, 26);
+            b.Size = new Size(b == newFolderButton ? 84 : b == renameButton ? 70 : 64, 26);
             x -= b.Width;
             b.Location = new Point(x, 48);
             b.Anchor = AnchorStyles.Top | AnchorStyles.Right;
@@ -153,6 +155,8 @@ class UploadForm : Form
         newFolderButton.Click += delegate { NewFolder(); };
         deleteButton.Text = "Delete...";
         deleteButton.Click += delegate { DeleteSelected(); };
+        renameButton.Text = "Rename...";
+        renameButton.Click += delegate { RenameSelected(); };
 
         remote.View = View.Details;
         remote.FullRowSelect = true;
@@ -168,6 +172,7 @@ class UploadForm : Form
         {
             if (e.KeyCode == Keys.Back) GoUp();
             else if (e.KeyCode == Keys.Delete) DeleteSelected();
+            else if (e.KeyCode == Keys.F2) RenameSelected();
             else if (e.KeyCode == Keys.F5) ListFolder();
         };
 
@@ -218,7 +223,7 @@ class UploadForm : Form
 
         fileBar.Maximum = totalBar.Maximum = 1000;
         Controls.AddRange(new Control[] { connectButton, ipButton, connLabel, dest, subfolder,
-            upButton, refreshButton, newFolderButton, deleteButton, split, fileBar, totalBar, status, via, addButton });
+            upButton, refreshButton, newFolderButton, renameButton, deleteButton, split, fileBar, totalBar, status, via, addButton });
         Shown += delegate { Connect(null, false); };
 
         DragEnter += (s, e) => e.Effect = e.Data.GetDataPresent(DataFormats.FileDrop) ? DragDropEffects.Copy : DragDropEffects.None;
@@ -722,6 +727,13 @@ class UploadForm : Form
 
     string Prompt(string title, string text, string value)
     {
+        return Prompt(title, text, value, -1);
+    }
+
+    // `selectLength` >= 0 selects that much of `value` from the start (a
+    // file's name without its extension), else all of it.
+    string Prompt(string title, string text, string value, int selectLength)
+    {
         using (var f = new Form { Text = title, FormBorderStyle = FormBorderStyle.FixedDialog, MinimizeBox = false,
             MaximizeBox = false, ShowInTaskbar = false, StartPosition = FormStartPosition.CenterParent,
             ClientSize = new Size(400, 170), Font = Font })
@@ -733,6 +745,7 @@ class UploadForm : Form
             f.Controls.AddRange(new Control[] { label, box, ok, cancel });
             f.AcceptButton = ok;
             f.CancelButton = cancel;
+            if (selectLength >= 0) f.Shown += delegate { box.Select(0, Math.Min(selectLength, box.Text.Length)); };
             return f.ShowDialog(this) == DialogResult.OK ? box.Text : null;
         }
     }
@@ -885,10 +898,17 @@ class UploadForm : Form
             remote.Items.AddRange(files.ToArray());
             if (remote.Items.Count == 0)
                 remote.Items.Add(new ListViewItem("(empty)") { ForeColor = SystemColors.GrayText });
+            if (selectAfter != null)
+                foreach (ListViewItem item in remote.Items)
+                {
+                    var e = item.Tag as Entry;
+                    if (e != null && e.Name == selectAfter) { item.Selected = item.Focused = true; item.EnsureVisible(); break; }
+                }
             remoteInfo.Text = (folders.Count > 0 ? folders.Count + " folder(s), " : "") + files.Count + " file(s), " + Human(total)
                 + (long.TryParse(lines[0].Trim(), out free) ? "   |   " + Human(free) + " free on the headset" : "");
         }
         remote.EndUpdate();
+        selectAfter = null;
     }
 
     void OpenSelected()
@@ -951,6 +971,61 @@ class UploadForm : Form
         var cmd = new StringBuilder("cd " + RemoteDir(sub) + " && rm -rf --");
         foreach (var e in entries) cmd.Append(' ').Append(Sh(e.Name));
         RunThenRelist(cmd.ToString(), sub);
+    }
+
+    // Renames one file or folder where it is. Refuses a name that is
+    // taken (mv -n, after a check that also catches a folder of that name,
+    // which mv would move the item into) and asks before an extension change.
+    void RenameSelected()
+    {
+        if (remote.SelectedItems.Count != 1) return;
+        var e = remote.SelectedItems[0].Tag as Entry;
+        if (e == null || e.Name == "." || e.Name == ".." || e.Name.IndexOf('/') >= 0) return;
+        string sub = CurrentSub();
+        if (busy && e.Dir)
+        {
+            MessageBox.Show(this, "Copies are under way. Rename folders once they finish.", Text);
+            return;
+        }
+        string oldExt = e.Dir ? "" : Path.GetExtension(e.Name);
+        string name = Prompt("Rename", "Rename " + (e.Dir ? "the folder " : "") + "\"" + e.Name + "\" in ~/Videos"
+            + (sub.Length > 0 ? "/" + sub : "") + " to:", e.Name, e.Name.Length - oldExt.Length);
+        if (name == null) return;
+        name = name.Trim();
+        if (name == e.Name) return;
+        if (name.Length == 0 || name == "." || name == ".." || name.IndexOfAny(new[] { '/', '\\' }) >= 0)
+        {
+            MessageBox.Show(this, "A name can't be empty, \".\" or \"..\", or contain / or \\.", Text);
+            return;
+        }
+        if (name[0] == '.')
+        {
+            MessageBox.Show(this, "A name starting with \".\" would hide it, here and in FrameCinema's Library.", Text);
+            return;
+        }
+        if (Encoding.UTF8.GetByteCount(name) > 255)
+        {
+            MessageBox.Show(this, "That name is too long for the headset (255 bytes at most).", Text);
+            return;
+        }
+        string newExt = e.Dir ? "" : Path.GetExtension(name);
+        if (!string.Equals(oldExt, newExt, StringComparison.OrdinalIgnoreCase) &&
+            MessageBox.Show(this, (newExt.Length == 0 ? "Drop the extension " + oldExt : "Change the extension from "
+                    + (oldExt.Length > 0 ? oldExt : "(none)") + " to " + newExt)
+                + "?\n\nFrameCinema goes by the extension, so the file may not play or show up.",
+                Text, MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+            return;
+        selectAfter = name;
+        RunThenRelist(RenameCommand(sub, e.Name, name), sub);
+    }
+
+    static string RenameCommand(string sub, string from, string to)
+    {
+        return "cd " + RemoteDir(sub) + " || exit 1; o=" + Sh(from) + "; n=" + Sh(to) + ";"
+            + " [ -e \"$o\" ] || [ -L \"$o\" ] || { echo \"$o is gone (renamed or deleted elsewhere?)\" >&2; exit 1; };"
+            + " if [ -e \"$n\" ] || [ -L \"$n\" ]; then echo \"$n already exists here\" >&2; exit 1; fi;"
+            + " mv -n -T -- \"$o\" \"$n\" && [ -e \"$n\" ] && ! [ -e \"$o\" ]"
+            + " || { echo \"couldn't rename it\" >&2; exit 1; }";
     }
 
     void RunThenRelist(string cmd, string showSub)

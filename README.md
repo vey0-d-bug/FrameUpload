@@ -12,7 +12,7 @@ It copies over ssh (the Frame has no SMB share), using the `frame` host entry in
 
 ## Headset view and Connect to Frame (v3)
 
-- The top half lists the headset's `~/Videos` folder: folders first, sizes, dates, and the free space on the headset. Double-click a folder (or press Enter) to open it, **Up** or Backspace to go back. The folder on show is where copies go. **New folder...** makes one there; **Delete...** (or the Delete key) removes the selected files or folders after a confirmation that names them. Hidden names, like the `.part` of a copy under way, are not shown.
+- The top half lists the headset's `~/Videos` folder: folders first, sizes, dates, and the free space on the headset. Double-click a folder (or press Enter) to open it, **Up** or Backspace to go back. The folder on show is where copies go. **New folder...** makes one there; **Rename...** (or F2) renames the selected file or folder, refusing a name that is taken (v5); **Delete...** (or the Delete key) removes the selected files or folders after a confirmation that names them. Hidden names, like the `.part` of a copy under way, are not shown.
 - **Connect to Frame** (also run when the window opens) tries the `frame` entry in `~/.ssh/config`, then the last IP that worked, then `frame.local`. If none answers, it asks for an IP. **Set IP...** asks straight away. The headset's address is saved in `%APPDATA%\FrameUpload\host.txt` whenever a connection works.
 - A fallback address replaces only the entry's `HostName` (`ssh -o HostName=IP frame`), so the entry's user and keys still apply, and copies go to whichever address connected. A new address's host key is accepted on first use (`StrictHostKeyChecking=accept-new`); a changed key is still refused.
 
