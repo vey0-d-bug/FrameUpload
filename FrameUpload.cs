@@ -12,6 +12,10 @@
 // out at times): it tries the entry, then the last IP that worked, then
 // frame.local, and asks for an IP. Copies go to whichever address connected.
 // v4: the headset view sorts by a clicked column and shows folder sizes (du).
+// v5: rename. v6: the view browses the whole headset, not just ~/Videos (a
+// path box, Places, hidden files), copies go to the folder on show, and
+// Download... copies headset files and folders back to the PC. Delete and
+// rename stay inside the home folder and removable drives.
 // Build: build.cmd (uses the .NET Framework csc.exe that ships with Windows).
 using System;
 using System.Collections.Generic;
@@ -25,7 +29,7 @@ using System.Windows.Forms;
 
 class Options
 {
-    public string Host = "frame", Sub = "", Ssh, Log;
+    public string Host = "frame", Sub = "", Dir, Ssh, Log;
     public int Streams;   // 0: the default for the ssh in use
     public bool Exit;     // close when the batch is done (scripted runs)
     public readonly List<string> Files = new List<string>();
@@ -38,7 +42,8 @@ static class Program
     {
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
-        // Optional: --host=NAME --sub=FOLDER --streams=N --ssh=PATH\ssh.exe
+        // Optional: --host=NAME --sub=FOLDER (under ~/Videos) --dir=PATH (any
+        // headset folder, ~/... or /...) --streams=N --ssh=PATH\ssh.exe
         // --log=FILE --exit FILE... (files passed in, e.g. by dropping them on
         // the exe icon, start copying right away).
         var o = new Options();
@@ -46,6 +51,7 @@ static class Program
         {
             if (a.StartsWith("--host=")) o.Host = a.Substring(7);
             else if (a.StartsWith("--sub=")) o.Sub = a.Substring(6);
+            else if (a.StartsWith("--dir=")) o.Dir = a.Substring(6);
             else if (a.StartsWith("--streams=")) int.TryParse(a.Substring(10), out o.Streams);
             else if (a.StartsWith("--ssh=")) o.Ssh = a.Substring(6);
             else if (a.StartsWith("--log=")) o.Log = a.Substring(6);
@@ -69,7 +75,10 @@ class UploadForm : Form
     readonly string sshExe;
     readonly bool gitSsh;
     readonly int streams;
-    readonly TextBox subfolder = new TextBox();
+    readonly TextBox pathBox = new TextBox();
+    readonly ComboBox places = new ComboBox();
+    readonly CheckBox hiddenBox = new CheckBox();
+    readonly Button downloadButton = new Button();
     readonly ListBox list = new ListBox();
     readonly ProgressBar fileBar = new ProgressBar();
     readonly ProgressBar totalBar = new ProgressBar();
@@ -89,16 +98,21 @@ class UploadForm : Form
     // The HostName that connected, passed to ssh as -o HostName= so the
     // "frame" entry's user and keys still apply; null: the entry as it is.
     volatile string hostName;
+    // The headset's home folder ($HOME), learned on connect: paths under it
+    // show as ~/..., and ".." can climb out of ~ once it is known.
+    volatile string home;
     int connecting;      // 1 while a connect runs
     int listSeq;         // drops listings that a newer one overtook
-    string listedSub;    // the folder the view shows
+    string listedPath;   // the folder the view shows (~/... or /...)
     string selectAfter;  // a name to select once the next listing shows
-    readonly Queue<string> queue = new Queue<string>();
+    string lastLocalDir; // where the last download went
+    readonly Queue<Job> queue = new Queue<Job>();
     readonly object queueLock = new object();
     bool busy;
     volatile string currentPart;   // the .part being written, for a quit mid-copy
+    volatile string currentLocalPart; // same for a download, on the PC
     readonly List<Process> live = new List<Process>();
-    int doneCount, failCount;
+    int doneCount, failCount, skipCount;
     long batchBytes, batchSent;
 
     public int FailCount { get { return failCount; } }
@@ -110,7 +124,8 @@ class UploadForm : Form
         // Measured on the Frame over 5 GHz Wi-Fi: Git's ssh 1 stream 40-55
         // MB/s, 4 streams 62, 8 streams 69; Windows' ssh 12-15 per stream.
         streams = o.Streams > 0 ? Math.Min(o.Streams, 16) : (gitSsh ? 6 : 8);
-        subfolder.Text = o.Sub;
+        string sub = o.Sub.Trim().Replace('\\', '/').Trim('/');
+        pathBox.Text = !string.IsNullOrEmpty(o.Dir) ? o.Dir : "~/Videos" + (sub.Length > 0 ? "/" + sub : "");
         if (o.Files.Count > 0) Shown += delegate { Enqueue(o.Files.ToArray()); };
         Text = "Frame Upload";
         ClientSize = new Size(640, 640);
@@ -132,21 +147,40 @@ class UploadForm : Form
         connLabel.AutoEllipsis = true;
         connLabel.Text = "Not connected yet.";
 
-        // The folder the view shows is the one files are copied to.
-        var dest = new Label { Text = "Copy to  ~/Videos/", AutoSize = true, Location = new Point(12, 53) };
-        subfolder.Location = new Point(118, 50);
-        subfolder.Width = 144;
-        subfolder.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
-        subfolder.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; ListFolder(); } };
+        // The folder the view shows is the one files are copied to. The box
+        // takes ~/..., /..., or a path relative to the folder on show.
+        var dest = new Label { Text = "Copy to", AutoSize = true, Location = new Point(12, 53) };
+        pathBox.Location = new Point(62, 50);
+        pathBox.Width = 352;
+        pathBox.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+        pathBox.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; ListFolder(); } };
+        tips.SetToolTip(pathBox, "A headset folder: ~/... (home), /... (anywhere), or a name inside the folder on show. Enter opens it.");
+        places.DropDownStyle = ComboBoxStyle.DropDownList;
+        places.Items.AddRange(new object[] { "Places...", "Videos", "Home", "Downloads", "SD card / USB", "Whole headset (/)" });
+        places.SelectedIndex = 0;
+        places.Size = new Size(140, 26);
+        places.Location = new Point(420, 50);
+        places.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        places.SelectedIndexChanged += delegate { GoToPlace(); };
+        upButton.Size = new Size(64, 26);
+        upButton.Location = new Point(564, 48);
+        upButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        hiddenBox.Text = "Show hidden";
+        hiddenBox.AutoSize = true;
+        hiddenBox.Location = new Point(14, 84);
+        hiddenBox.CheckedChanged += delegate { ListFolder(); };
         var x = 628;
-        foreach (var b in new[] { deleteButton, renameButton, newFolderButton, refreshButton, upButton })
+        foreach (var b in new[] { downloadButton, deleteButton, renameButton, newFolderButton, refreshButton })
         {
-            b.Size = new Size(b == newFolderButton ? 84 : b == renameButton ? 70 : 64, 26);
+            b.Size = new Size(b == newFolderButton ? 84 : b == renameButton ? 70 : b == downloadButton ? 84 : 64, 26);
             x -= b.Width;
-            b.Location = new Point(x, 48);
+            b.Location = new Point(x, 80);
             b.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             x -= 4;
         }
+        downloadButton.Text = "Download...";
+        downloadButton.Click += delegate { DownloadSelected(); };
+        tips.SetToolTip(downloadButton, "Copy the selected headset files or folders to a folder on this PC.");
         upButton.Text = "Up";
         upButton.Click += delegate { GoUp(); };
         refreshButton.Text = "Refresh";
@@ -183,10 +217,10 @@ class UploadForm : Form
         var split = new SplitContainer
         {
             Orientation = Orientation.Horizontal,
-            Location = new Point(12, 80),
-            Size = new Size(616, 424),
+            Location = new Point(12, 112),
+            Size = new Size(616, 392),
             Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
-            SplitterDistance = 270,
+            SplitterDistance = 250,
             SplitterWidth = 6,
         };
         remoteInfo.Dock = DockStyle.Bottom;
@@ -222,8 +256,8 @@ class UploadForm : Form
         addButton.Click += delegate { PickFiles(); };
 
         fileBar.Maximum = totalBar.Maximum = 1000;
-        Controls.AddRange(new Control[] { connectButton, ipButton, connLabel, dest, subfolder,
-            upButton, refreshButton, newFolderButton, renameButton, deleteButton, split, fileBar, totalBar, status, via, addButton });
+        Controls.AddRange(new Control[] { connectButton, ipButton, connLabel, dest, pathBox, places, upButton, hiddenBox,
+            refreshButton, newFolderButton, renameButton, deleteButton, downloadButton, split, fileBar, totalBar, status, via, addButton });
         Shown += delegate { Connect(null, false); };
 
         DragEnter += (s, e) => e.Effect = e.Data.GetDataPresent(DataFormats.FileDrop) ? DragDropEffects.Copy : DragDropEffects.None;
@@ -231,7 +265,7 @@ class UploadForm : Form
         FormClosing += (s, e) =>
         {
             if (busy && e.CloseReason == CloseReason.UserClosing &&
-                MessageBox.Show(this, "An upload is still running. Quit anyway?", Text,
+                MessageBox.Show(this, "A copy is still running. Quit anyway?", Text,
                     MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
                 e.Cancel = true;
             else if (busy) StopAndCleanUp();
@@ -247,78 +281,88 @@ class UploadForm : Form
         }
     }
 
+    // One file to copy: PC -> headset (Dir: the headset folder), or with
+    // Down set, headset -> PC (Remote: the headset file, Local: where it goes).
+    class Job
+    {
+        public bool Down;
+        public string Local, Dir, Remote, Label;
+        public long Size;
+    }
+
     void Enqueue(string[] paths)
     {
-        string sub;
-        if (!TryCleanSubfolder(subfolder.Text, out sub))
+        string dir, why;
+        if ((dir = Resolve(pathBox.Text, out why)) == null)
         {
-            MessageBox.Show(this, "The subfolder name can't contain \"..\" or start with ~.", Text);
+            MessageBox.Show(this, why, Text);
             return;
         }
-        int added = 0;
-        lock (queueLock)
+        var jobs = new List<Job>();
+        foreach (var p in paths)
         {
-            if (!busy) { doneCount = failCount = 0; batchBytes = batchSent = 0; }
-            foreach (var p in paths)
-            {
-                if (!File.Exists(p)) continue; // folders are skipped
-                queue.Enqueue(sub + "\n" + p);
-                batchBytes += new FileInfo(p).Length;
-                list.Items.Add("waiting   " + Path.GetFileName(p));
-                added++;
-            }
-            if (added > 0 && !busy)
-            {
-                busy = true;
-                new Thread(Worker) { IsBackground = true }.Start();
-            }
+            if (!File.Exists(p)) continue; // folders are skipped
+            jobs.Add(new Job { Local = p, Dir = dir, Label = Path.GetFileName(p), Size = new FileInfo(p).Length });
         }
-        if (added == 0)
+        if (Enqueue(jobs) == 0)
         {
             status.Text = "Nothing to copy (folders are skipped; drop the files themselves).";
             if (opt.Exit && !busy) Close();
         }
     }
 
-    static bool TryCleanSubfolder(string text, out string sub)
+    int Enqueue(List<Job> jobs)
     {
-        sub = text.Trim().Replace('\\', '/').Trim('/');
-        if (sub.StartsWith("~")) return false;
-        foreach (var part in sub.Split('/'))
-            if (part == "..") return false;
-        return true;
+        lock (queueLock)
+        {
+            if (!busy) { doneCount = failCount = skipCount = 0; batchBytes = batchSent = 0; }
+            foreach (var j in jobs)
+            {
+                queue.Enqueue(j);
+                batchBytes += j.Size;
+                list.Items.Add("waiting   " + j.Label);
+            }
+            if (jobs.Count > 0 && !busy)
+            {
+                busy = true;
+                new Thread(Worker) { IsBackground = true }.Start();
+            }
+        }
+        if (jobs.Count > 0) list.TopIndex = Math.Max(0, list.Items.Count - 1);
+        return jobs.Count;
     }
 
     void Worker()
     {
+        bool toVideos = false;
         while (true)
         {
-            string item;
+            Job job;
             lock (queueLock)
             {
                 if (queue.Count == 0) { busy = false; break; }
-                item = queue.Dequeue();
+                job = queue.Dequeue();
             }
-            int nl = item.IndexOf('\n');
-            string sub = item.Substring(0, nl), path = item.Substring(nl + 1);
-            string name = Path.GetFileName(path);
             string error = null;
             var watch = Stopwatch.StartNew();
             int used = 1;
-            try { error = Copy(path, sub, name, out used); }
+            try { error = job.Down ? Download(job) : Copy(job.Local, job.Dir, job.Label, job.Size, out used); }
             catch (Exception ex) { error = ex.Message; }
-            if (error == null) doneCount++; else failCount++;
-            Log(name, new FileInfo(path).Length, watch.Elapsed.TotalSeconds, used, error);
-            UI(delegate { MarkItem(name, error == null ? "copied    " : "FAILED    "); });
-            if (error != null) UI(delegate { list.Items.Add("    " + error); });
+            if (error == null) doneCount++; else if (error == Skipped) skipCount++; else failCount++;
+            if (!job.Down && InVideos(job.Dir)) toVideos = true;
+            Log(job.Label, job.Size, watch.Elapsed.TotalSeconds, used, error);
+            string label = job.Label;
+            UI(delegate { MarkItem(label, error == null ? "copied    " : error == Skipped ? "skipped   " : "FAILED    "); });
+            if (error != null && error != Skipped) UI(delegate { list.Items.Add("    " + error); });
         }
         UI(delegate
         {
             fileBar.Value = 0;
             totalBar.Value = failCount == 0 ? 1000 : totalBar.Value;
+            string skipped = skipCount > 0 ? " " + skipCount + " already on the PC, left as they were." : "";
             status.Text = failCount == 0
-                ? "Done: " + doneCount + " file(s) copied. They show up in FrameCinema's Library."
-                : "Finished with errors: " + doneCount + " copied, " + failCount + " failed (see list).";
+                ? "Done: " + doneCount + " file(s) copied." + skipped + (toVideos ? " They show up in FrameCinema's Library." : "")
+                : "Finished with errors: " + doneCount + " copied, " + failCount + " failed (see list)." + skipped;
             if (opt.Exit) { Close(); return; }
             ListFolder();
             (failCount == 0 ? SystemSounds.Asterisk : SystemSounds.Hand).Play();
@@ -339,12 +383,11 @@ class UploadForm : Form
     // whole, so FrameCinema never sees a half-copied file. Small files stream
     // into "cat"; big ones go as `used` byte ranges at once, each into "dd"
     // at its offset of a .part made at full size up front.
-    string Copy(string path, string sub, string name, out int used)
+    string Copy(string path, string headsetDir, string name, long size, out int used)
     {
-        string dir = "$HOME/Videos" + (sub.Length > 0 ? "/" + Sh(sub) : "");
+        string dir = ShellPath(headsetDir);
         string part = dir + "/" + Sh("." + name + ".part");
         string final = dir + "/" + Sh(name);
-        long size = new FileInfo(path).Length;
         currentPart = part;
 
         int n =size < ParallelMin ? 1 : (int)Math.Max(1, Math.Min(streams, size / RangeMin));
@@ -422,13 +465,7 @@ class UploadForm : Form
         {
             bool alive = false;
             foreach (var t in threads) if (t.IsAlive) { alive = true; break; }
-            long s = Interlocked.Read(ref sent), b = Interlocked.Read(ref batchSent);
-            double mbps = s / 1048576.0 / Math.Max(watch.Elapsed.TotalSeconds, 0.001);
-            int f = size > 0 ? (int)Math.Min(1000, s * 1000 / size) : 1000;
-            int tt = batchBytes > 0 ? (int)Math.Min(1000, b * 1000 / batchBytes) : 1000;
-            string msg = string.Format("Copying {0}  {1} / {2}  ({3:0.0} MB/s{4})",
-                name, Mb(s), Mb(size), mbps, ranges.Length > 1 ? ", " + ranges.Length + " streams" : "");
-            UI(delegate { fileBar.Value = f; totalBar.Value = tt; status.Text = msg; });
+            ShowProgress(name, Interlocked.Read(ref sent), size, watch.Elapsed.TotalSeconds, ranges.Length);
             if (!alive) break;
             Thread.Sleep(200);
         }
@@ -481,6 +518,74 @@ class UploadForm : Form
         return null;
     }
 
+    const string Skipped = "skipped";
+
+    // Copies one headset file to the PC: "cat" over ssh into a .part next to
+    // the target, renamed when the size matches. A file already on the PC is
+    // left alone (the job is marked skipped).
+    string Download(Job job)
+    {
+        if (File.Exists(job.Local) || Directory.Exists(job.Local)) return Skipped;
+        Directory.CreateDirectory(Path.GetDirectoryName(job.Local));
+        string part = job.Local + ".part";
+        currentLocalPart = part;
+        var stderr = new StringBuilder();
+        long got = 0;
+        bool ok = false;
+        try
+        {
+            using (var proc = StartSsh("cat -- " + ShellPath(job.Remote), stderr, null, hostName, 10, true))
+            {
+                proc.StandardInput.Close();
+                var buf = new byte[1 << 20];
+                var watch = Stopwatch.StartNew();
+                long shown = -1;
+                using (var src = proc.StandardOutput.BaseStream)
+                using (var dst = new FileStream(part, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 16))
+                {
+                    int n;
+                    while ((n = src.Read(buf, 0, buf.Length)) > 0)
+                    {
+                        dst.Write(buf, 0, n);
+                        got += n;
+                        Interlocked.Add(ref batchSent, n);
+                        long ms = watch.ElapsedMilliseconds;
+                        if (ms - shown >= 200) { shown = ms; ShowProgress(job.Label, got, job.Size, watch.Elapsed.TotalSeconds, 1); }
+                    }
+                }
+                proc.WaitForExit();
+                if (proc.ExitCode != 0)
+                {
+                    string why;
+                    lock (stderr) why = stderr.ToString().Trim();
+                    return why.Length > 0 ? why.Replace("\r", "").Replace("\n", " | ") : "ssh exit code " + proc.ExitCode;
+                }
+            }
+            // The size listed when it was queued: a file still growing on
+            // the headset (a copy under way) doesn't count as whole.
+            if (got != job.Size) return "got " + got + " bytes, the headset listed " + job.Size;
+            File.Move(part, job.Local);
+            ok = true;
+            return null;
+        }
+        finally
+        {
+            currentLocalPart = null;
+            if (!ok) try { File.Delete(part); } catch (Exception) { }
+        }
+    }
+
+    void ShowProgress(string name, long s, long size, double seconds, int ranges)
+    {
+        long b = Interlocked.Read(ref batchSent);
+        double mbps = s / 1048576.0 / Math.Max(seconds, 0.001);
+        int f = size > 0 ? (int)Math.Min(1000, s * 1000 / size) : 1000;
+        int tt = batchBytes > 0 ? (int)Math.Min(1000, b * 1000 / batchBytes) : 1000;
+        string msg = string.Format("Copying {0}  {1} / {2}  ({3:0.0} MB/s{4})",
+            name, Mb(s), Mb(size), mbps, ranges > 1 ? ", " + ranges + " streams" : "");
+        UI(delegate { fileBar.Value = f; totalBar.Value = tt; status.Text = msg; });
+    }
+
     // Runs a command on the headset with no input; null when it succeeds.
     string RunRemote(string remote)
     {
@@ -513,6 +618,12 @@ class UploadForm : Form
 
     Process StartSsh(string remote, StringBuilder stderr, StringBuilder stdout, string host, int timeout)
     {
+        return StartSsh(remote, stderr, stdout, host, timeout, false);
+    }
+
+    // `rawOut`: stdout is left for the caller to read as bytes (a download).
+    Process StartSsh(string remote, StringBuilder stderr, StringBuilder stdout, string host, int timeout, bool rawOut)
+    {
         // AES-GCM first: both ends have AES instructions, and it beat
         // chacha20 on the Frame (55 vs 50 MB/s on one stream). A HostName
         // from Connect replaces only the entry's address; accept-new lets a
@@ -544,7 +655,7 @@ class UploadForm : Form
         proc.ErrorDataReceived += (s, e) => { if (e.Data != null) lock (stderr) stderr.AppendLine(e.Data); };
         proc.OutputDataReceived += (s, e) => { if (e.Data != null && stdout != null) lock (stdout) stdout.AppendLine(e.Data); };
         proc.BeginErrorReadLine();
-        proc.BeginOutputReadLine();
+        if (!rawOut) proc.BeginOutputReadLine();
         return proc;
     }
 
@@ -554,6 +665,8 @@ class UploadForm : Form
     {
         lock (queueLock) queue.Clear();
         lock (live) { foreach (var p in live) Kill(p); live.Clear(); }
+        string local = currentLocalPart;
+        if (local != null) try { File.Delete(local); } catch (Exception) { } // may still be open; best effort
         string part = currentPart;
         if (part == null) return;
         try
@@ -667,20 +780,22 @@ class UploadForm : Form
         }
         new Thread(delegate ()
         {
-            string firstError = null, ip = null, worked = null;
+            string firstError = null, ip = null, worked = null, dir = null;
             bool ok = false;
             foreach (var h in tries)
             {
                 string name = h ?? opt.Host;
                 UI(delegate { SetConn("Trying " + name + "...", SystemColors.GrayText); });
                 string output;
-                string error = RunRemote("echo $SSH_CONNECTION", h, 5, out output);
+                string error = RunRemote("echo $SSH_CONNECTION; echo \"$HOME\"", h, 5, out output);
                 if (error == null)
                 {
                     ok = true;
                     worked = h;
-                    var f = output.Trim().Split(' ');
+                    var lines = output.Replace("\r", "").Split('\n');
+                    var f = lines[0].Trim().Split(' ');
                     if (f.Length >= 3 && ValidHost(f[2])) ip = f[2];
+                    if (lines.Length > 1 && lines[1].StartsWith("/") && lines[1].Length > 1) dir = lines[1].TrimEnd('/');
                     break;
                 }
                 if (firstError == null) firstError = name + ": " + error;
@@ -692,6 +807,7 @@ class UploadForm : Form
                 if (ok)
                 {
                     hostName = worked;
+                    if (dir != null) home = dir;
                     if (ip != null) SaveIp(ip);
                     string name = worked ?? opt.Host;
                     SetConn("Connected to " + name + (ip != null && ip != name ? " (" + ip + ")" : ""), Color.ForestGreen);
@@ -750,7 +866,7 @@ class UploadForm : Form
         }
     }
 
-    // ---- The headset's ~/Videos ----
+    // ---- The headset's folders ----
 
     class Entry
     {
@@ -802,62 +918,158 @@ class UploadForm : Form
             remote.Columns[i].Text = columnTitles[i] + (i == sorter.Column ? (sorter.Descending ? "  ▼" : "  ▲") : "");
     }
 
-    static string RemoteDir(string sub) { return "$HOME/Videos" + (sub.Length > 0 ? "/" + Sh(sub) : ""); }
-
-    static string Join(string sub, string name) { return sub.Length > 0 ? sub + "/" + name : name; }
-
-    // The folder on show, else the one typed in the box.
-    string CurrentSub()
+    // Headset paths are kept as ~ or ~/... (under the home folder) or /...;
+    // ShellPath makes one a quoted word for the remote shell.
+    static string ShellPath(string p)
     {
-        string sub;
-        if (listedSub != null) return listedSub;
-        return TryCleanSubfolder(subfolder.Text, out sub) ? sub : "";
+        if (p == "~") return "\"$HOME\"";
+        if (p.StartsWith("~/")) return "\"$HOME\"/" + Sh(p.Substring(2));
+        return Sh(p);
     }
 
-    // Lists the folder in the box (hidden names, like the .part files of
-    // copies under way, are left out) and the free space on the headset.
+    static string Join(string dir, string name) { return dir == "/" ? "/" + name : dir + "/" + name; }
+
+    static bool InVideos(string p) { return p == "~/Videos" || p.StartsWith("~/Videos/"); }
+
+    // Where delete and rename work: the home folder, and SD cards and USB
+    // drives (SteamOS mounts them under /run/media). Elsewhere the system's
+    // own files are read-only to this user anyway, or not ours to remove.
+    static bool MayChange(string dir) { return dir == "~" || dir.StartsWith("~/") || dir.StartsWith("/run/media/"); }
+
+    const string MayChangeText = "Delete and rename work in your home folder (~) and on SD cards and USB drives (/run/media).";
+
+    // An absolute path, shown as ~/... when it is under the home folder.
+    string Tidy(string abs)
+    {
+        string h = home;
+        if (h != null && (abs == h || abs.StartsWith(h + "/"))) return "~" + abs.Substring(h.Length);
+        return abs;
+    }
+
+    // The folder that holds `p`, or null at the top (or above ~ before the
+    // home folder is known).
+    string ParentOf(string p)
+    {
+        if (p == "/") return null;
+        if (p == "~")
+        {
+            string h = home;
+            return h == null ? null : Tidy(h.Substring(0, Math.Max(1, h.LastIndexOf('/'))));
+        }
+        int slash = p.LastIndexOf('/');
+        return slash <= 0 ? "/" : slash == 1 && p[0] == '~' ? "~" : p.Substring(0, slash);
+    }
+
+    // Reads a typed path: ~/..., /..., or a path inside the folder on show;
+    // "." and ".." are worked out here. Null (and why) when it can't be used.
+    string Resolve(string text, out string why)
+    {
+        why = null;
+        string t = text.Trim().Replace('\\', '/');
+        if (t.Length == 0) t = "~";
+        bool fromHome;
+        if (t == "~" || t.StartsWith("~/")) { fromHome = true; t = t.Substring(1); }
+        else if (t.StartsWith("~")) { why = "Only your own home folder can be written with ~ (as ~ or ~/...)."; return null; }
+        else if (t.StartsWith("/")) fromHome = false;
+        else
+        {
+            string here = listedPath ?? "~";
+            fromHome = here[0] == '~';
+            t = (fromHome ? here.Substring(1) : here) + "/" + t;
+        }
+        var parts = new List<string>();
+        foreach (var s in t.Split('/'))
+        {
+            if (s.Length == 0 || s == ".") continue;
+            if (s != "..") { parts.Add(s); continue; }
+            if (parts.Count > 0) { parts.RemoveAt(parts.Count - 1); continue; }
+            if (!fromHome) continue; // / has no parent
+            string h = home;
+            if (h == null) { why = "Connect first: going above ~ needs the headset's home folder."; return null; }
+            fromHome = false;
+            parts.AddRange(h.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries));
+            if (parts.Count > 0) parts.RemoveAt(parts.Count - 1);
+        }
+        string joined = string.Join("/", parts.ToArray());
+        return fromHome ? (joined.Length > 0 ? "~/" + joined : "~") : Tidy("/" + joined);
+    }
+
+    // The folder in the box: the one on show when it wasn't edited (so a
+    // name with a backslash survives), else what was typed.
+    string TargetDir(out string why)
+    {
+        why = null;
+        if (listedPath != null && pathBox.Text == listedPath) return listedPath;
+        return Resolve(pathBox.Text, out why);
+    }
+
+    // The folder on show, else the one typed in the box, else ~.
+    string CurrentDir()
+    {
+        string why;
+        return listedPath ?? Resolve(pathBox.Text, out why) ?? "~";
+    }
+
     void ListFolder()
     {
-        string sub;
-        if (!TryCleanSubfolder(subfolder.Text, out sub))
-        {
-            MessageBox.Show(this, "The subfolder name can't contain \"..\" or start with ~.", Text);
-            return;
-        }
+        string why, p = TargetDir(out why);
+        if (p == null) { MessageBox.Show(this, why, Text); return; }
+        ListPath(p);
+    }
+
+    // Lists a headset folder (hidden names only when Show hidden is ticked,
+    // and never the .part of a copy under way), whether it can be written
+    // to, and the free space there.
+    void ListPath(string p)
+    {
         int seq = ++listSeq;
         string host = hostName;
-        string cmd = "d=" + RemoteDir(sub) + "; [ -d \"$d\" ] || { echo MISSING; exit 0; }; cd \"$d\""
-            + " && df -B1 --output=avail . | tail -n 1"
-            + " && find . -mindepth 1 -maxdepth 1 ! -name '.*' -printf '%Y\\t%s\\t%T@\\t%f\\n'"
-            // Folder sizes: du reads only metadata, well under a second for ~/Videos.
-            + " && echo SIZES && { find . -mindepth 1 -maxdepth 1 -type d ! -name '.*' -exec du -s --apparent-size -B1 {} + 2>/dev/null; true; }";
-        remoteInfo.Text = "Listing ~/Videos" + (sub.Length > 0 ? "/" + sub : "") + "...";
+        string hide = hiddenBox.Checked ? "! -name '.*.part'" : "! -name '.*'";
+        string cmd = "d=" + ShellPath(p) + "; [ -d \"$d\" ] || { echo MISSING; exit 0; }; cd \"$d\" || { echo DENIED; exit 0; }"
+            + "; df -B1 --output=avail . 2>/dev/null | tail -n 1 | tr -d ' '; [ -w . ] && echo RW || echo RO"
+            + "; find . -mindepth 1 -maxdepth 1 " + hide + " -printf '%Y\\t%s\\t%T@\\t%f\\n' 2>/dev/null"
+            + "; echo SIZES";
+        // Folder sizes in the home folder and on drives: du reads only
+        // metadata, but a big tree could take a while, so each folder gets
+        // 3 s and all of them 4 s; the rest show as "folder".
+        if (MayChange(p))
+            cmd += "; find . -mindepth 1 -maxdepth 1 -type d " + hide + " -exec sh -c"
+                + " 'end=$(($(date +%s)+4)); for x; do [ \"$(date +%s)\" -lt \"$end\" ] || break;"
+                + " timeout 3 du -s --apparent-size -B1 -- \"$x\" 2>/dev/null; done' sh {} +";
+        cmd += "; true";
+        remoteInfo.Text = "Listing " + p + "...";
         new Thread(delegate ()
         {
             string output;
             string error = RunRemote(cmd, host, 5, out output);
-            UI(delegate { if (seq == listSeq) ShowListing(sub, error, output); });
+            UI(delegate { if (seq == listSeq) ShowListing(p, error, output); });
         }) { IsBackground = true }.Start();
     }
 
-    void ShowListing(string sub, string error, string output)
+    void ShowListing(string p, string error, string output)
     {
-        listedSub = sub;
-        subfolder.Text = sub;
-        upButton.Enabled = sub.Length > 0;
-        string where = "~/Videos" + (sub.Length > 0 ? "/" + sub : "");
+        listedPath = p;
+        pathBox.Text = p;
+        upButton.Enabled = ParentOf(p) != null;
+        renameButton.Enabled = deleteButton.Enabled = MayChange(p);
         remote.BeginUpdate();
         remote.Items.Clear();
-        columnTitles[0] = where;
+        columnTitles[0] = p;
         ShowSortArrow();
+        string first = (output ?? "").Trim();
         if (error != null)
         {
             remote.Items.Add(new ListViewItem("Can't list it: " + error) { ForeColor = Color.Firebrick });
             remoteInfo.Text = "Not connected? Try Connect to Frame.";
         }
-        else if (output.Trim() == "MISSING")
+        else if (first == "MISSING")
         {
             remote.Items.Add(new ListViewItem("(no such folder yet: copying here makes it)") { ForeColor = SystemColors.GrayText });
+            remoteInfo.Text = "";
+        }
+        else if (first == "DENIED")
+        {
+            remote.Items.Add(new ListViewItem("(this folder can't be opened: no permission)") { ForeColor = SystemColors.GrayText });
             remoteInfo.Text = "";
         }
         else
@@ -876,7 +1088,8 @@ class UploadForm : Form
                 long n;
                 if (d.Length == 2 && d[1].StartsWith("./") && long.TryParse(d[0], out n)) dirSizes[d[1].Substring(2)] = n;
             }
-            for (int i = 1; i < mark; i++)
+            // Line 0 is the free space, line 1 RW or RO, then the entries.
+            for (int i = 2; i < mark; i++)
             {
                 var f = lines[i].Split(new[] { '\t' }, 4);
                 if (f.Length < 4 || f[3].Length == 0) continue;
@@ -891,6 +1104,7 @@ class UploadForm : Form
                 item.SubItems.Add(size < 0 ? "folder" : Human(size));
                 item.SubItems.Add(new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(t).ToLocalTime().ToString("yyyy-MM-dd HH:mm"));
                 item.Tag = new Entry { Name = f[3], Dir = dir, Size = size, Time = t };
+                if (f[3][0] == '.') item.ForeColor = SystemColors.GrayText;
                 (dir ? folders : files).Add(item);
                 if (size > 0) total += size;
             }
@@ -905,7 +1119,8 @@ class UploadForm : Form
                     if (e != null && e.Name == selectAfter) { item.Selected = item.Focused = true; item.EnsureVisible(); break; }
                 }
             remoteInfo.Text = (folders.Count > 0 ? folders.Count + " folder(s), " : "") + files.Count + " file(s), " + Human(total)
-                + (long.TryParse(lines[0].Trim(), out free) ? "   |   " + Human(free) + " free on the headset" : "");
+                + (long.TryParse(lines[0].Trim(), out free) ? "   |   " + Human(free) + " free there" : "")
+                + (lines.Length > 1 && lines[1] == "RO" ? "   |   read-only" : "");
         }
         remote.EndUpdate();
         selectAfter = null;
@@ -916,36 +1131,27 @@ class UploadForm : Form
         if (remote.SelectedItems.Count != 1) return;
         var e = remote.SelectedItems[0].Tag as Entry;
         if (e == null || !e.Dir) return;
-        subfolder.Text = Join(CurrentSub(), e.Name);
-        ListFolder();
+        ListPath(Join(CurrentDir(), e.Name));
     }
 
+    // Goes to the folder above, with the one just left selected.
     void GoUp()
     {
-        string sub = CurrentSub();
-        if (sub.Length == 0) return;
-        int slash = sub.LastIndexOf('/');
-        subfolder.Text = slash < 0 ? "" : sub.Substring(0, slash);
-        ListFolder();
+        string here = CurrentDir(), up = ParentOf(here);
+        if (up == null) return;
+        selectAfter = here == "~" ? home.Substring(home.LastIndexOf('/') + 1) : here.Substring(here.LastIndexOf('/') + 1);
+        ListPath(up);
     }
 
-    void NewFolder()
+    void GoToPlace()
     {
-        string sub = CurrentSub();
-        string name = Prompt("New folder", "Make a folder in ~/Videos" + (sub.Length > 0 ? "/" + sub : "") + " named:", "");
-        if (name == null) return;
-        name = name.Trim();
-        if (name.Length == 0 || name == "." || name == ".." || name.IndexOfAny(new[] { '/', '\\' }) >= 0)
-        {
-            MessageBox.Show(this, "A folder name can't be empty, \".\" or \"..\", or contain / or \\.", Text);
-            return;
-        }
-        string target = Join(sub, name);
-        RunThenRelist("mkdir -p " + RemoteDir(target), target);
+        int i = places.SelectedIndex;
+        if (i <= 0) return;
+        places.SelectedIndex = 0; // back to "Places...", so the same place can be picked again
+        ListPath(new[] { null, "~/Videos", "~", "~/Downloads", "/run/media", "/" }[i]);
     }
 
-    // Asks first: names the items, says folders go with everything in them.
-    void DeleteSelected()
+    List<Entry> SelectedEntries()
     {
         var entries = new List<Entry>();
         foreach (ListViewItem item in remote.SelectedItems)
@@ -953,8 +1159,47 @@ class UploadForm : Form
             var e = item.Tag as Entry;
             if (e != null && e.Name != "." && e.Name != ".." && e.Name.IndexOf('/') < 0) entries.Add(e);
         }
+        return entries;
+    }
+
+    void NewFolder()
+    {
+        string dir = CurrentDir();
+        string name = Prompt("New folder", "Make a folder in " + dir + " named:", "");
+        if (name == null) return;
+        name = name.Trim();
+        if (name.Length == 0 || name == "." || name == ".." || name.IndexOfAny(new[] { '/', '\\' }) >= 0)
+        {
+            MessageBox.Show(this, "A folder name can't be empty, \".\" or \"..\", or contain / or \\.", Text);
+            return;
+        }
+        string target = Join(dir, name);
+        RunThenRelist("mkdir -p " + ShellPath(target), target);
+    }
+
+    // Hidden items right in ~ hold the headset's own settings, the ssh key
+    // this tool connects with among them.
+    bool Protected(string dir, List<Entry> entries)
+    {
+        if (!MayChange(dir)) { MessageBox.Show(this, MayChangeText, Text); return true; }
+        if (dir != "~") return false;
+        foreach (var e in entries)
+            if (e.Name[0] == '.')
+            {
+                MessageBox.Show(this, "Hidden items in ~ (like " + e.Name + ") hold the headset's own settings, "
+                    + "and the ssh key this tool uses, so they can't be changed from here.", Text);
+                return true;
+            }
+        return false;
+    }
+
+    // Asks first: names the items, says folders go with everything in them.
+    void DeleteSelected()
+    {
+        var entries = SelectedEntries();
         if (entries.Count == 0) return;
-        string sub = CurrentSub();
+        string dir = CurrentDir();
+        if (Protected(dir, entries)) return;
         var names = new StringBuilder();
         bool anyDir = false;
         for (int i = 0; i < entries.Count; i++)
@@ -963,33 +1208,39 @@ class UploadForm : Form
             if (i < 12) names.Append("    ").Append(entries[i].Name).Append(entries[i].Dir ? "/" : "").Append('\n');
         }
         if (entries.Count > 12) names.Append("    ...and ").Append(entries.Count - 12).Append(" more\n");
-        if (MessageBox.Show(this, "Delete " + (entries.Count == 1 ? "this" : "these " + entries.Count) + " from the headset's ~/Videos"
-                + (sub.Length > 0 ? "/" + sub : "") + "?\n\n" + names
-                + (anyDir ? "\nFolders are deleted with everything in them." : "") + "\nThis can't be undone.",
+        if (MessageBox.Show(this, "Delete " + (entries.Count == 1 ? "this" : "these " + entries.Count) + " from the headset's "
+                + dir + "?\n\n" + names
+                + (anyDir ? "\nFolders are deleted with everything in them." : "")
+                + (InVideos(dir) ? "" : "\nThis is outside ~/Videos: be sure nothing on the headset needs it.")
+                + "\nThis can't be undone.",
                 Text, MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
             return;
-        var cmd = new StringBuilder("cd " + RemoteDir(sub) + " && rm -rf --");
+        var cmd = new StringBuilder("cd " + ShellPath(dir) + " && rm -rf --");
         foreach (var e in entries) cmd.Append(' ').Append(Sh(e.Name));
-        RunThenRelist(cmd.ToString(), sub);
+        RunThenRelist(cmd.ToString(), dir);
     }
 
     // Renames one file or folder where it is. Refuses a name that is
     // taken (mv -n, after a check that also catches a folder of that name,
-    // which mv would move the item into) and asks before an extension change.
+    // which mv would move the item into). In ~/Videos it asks before an
+    // extension change and refuses a hidden name, since FrameCinema goes by
+    // both.
     void RenameSelected()
     {
         if (remote.SelectedItems.Count != 1) return;
         var e = remote.SelectedItems[0].Tag as Entry;
         if (e == null || e.Name == "." || e.Name == ".." || e.Name.IndexOf('/') >= 0) return;
-        string sub = CurrentSub();
+        string dir = CurrentDir();
+        if (Protected(dir, new List<Entry> { e })) return;
         if (busy && e.Dir)
         {
             MessageBox.Show(this, "Copies are under way. Rename folders once they finish.", Text);
             return;
         }
+        bool videos = InVideos(dir);
         string oldExt = e.Dir ? "" : Path.GetExtension(e.Name);
-        string name = Prompt("Rename", "Rename " + (e.Dir ? "the folder " : "") + "\"" + e.Name + "\" in ~/Videos"
-            + (sub.Length > 0 ? "/" + sub : "") + " to:", e.Name, e.Name.Length - oldExt.Length);
+        string name = Prompt("Rename", "Rename " + (e.Dir ? "the folder " : "") + "\"" + e.Name + "\" in "
+            + dir + " to:", e.Name, e.Name.Length - oldExt.Length);
         if (name == null) return;
         name = name.Trim();
         if (name == e.Name) return;
@@ -998,7 +1249,7 @@ class UploadForm : Form
             MessageBox.Show(this, "A name can't be empty, \".\" or \"..\", or contain / or \\.", Text);
             return;
         }
-        if (name[0] == '.')
+        if (videos && name[0] == '.')
         {
             MessageBox.Show(this, "A name starting with \".\" would hide it, here and in FrameCinema's Library.", Text);
             return;
@@ -1009,26 +1260,26 @@ class UploadForm : Form
             return;
         }
         string newExt = e.Dir ? "" : Path.GetExtension(name);
-        if (!string.Equals(oldExt, newExt, StringComparison.OrdinalIgnoreCase) &&
+        if (videos && !string.Equals(oldExt, newExt, StringComparison.OrdinalIgnoreCase) &&
             MessageBox.Show(this, (newExt.Length == 0 ? "Drop the extension " + oldExt : "Change the extension from "
                     + (oldExt.Length > 0 ? oldExt : "(none)") + " to " + newExt)
                 + "?\n\nFrameCinema goes by the extension, so the file may not play or show up.",
                 Text, MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
             return;
         selectAfter = name;
-        RunThenRelist(RenameCommand(sub, e.Name, name), sub);
+        RunThenRelist(RenameCommand(dir, e.Name, name), dir);
     }
 
-    static string RenameCommand(string sub, string from, string to)
+    static string RenameCommand(string dir, string from, string to)
     {
-        return "cd " + RemoteDir(sub) + " || exit 1; o=" + Sh(from) + "; n=" + Sh(to) + ";"
+        return "cd " + ShellPath(dir) + " || exit 1; o=" + Sh(from) + "; n=" + Sh(to) + ";"
             + " [ -e \"$o\" ] || [ -L \"$o\" ] || { echo \"$o is gone (renamed or deleted elsewhere?)\" >&2; exit 1; };"
             + " if [ -e \"$n\" ] || [ -L \"$n\" ]; then echo \"$n already exists here\" >&2; exit 1; fi;"
             + " mv -n -T -- \"$o\" \"$n\" && [ -e \"$n\" ] && ! [ -e \"$o\" ]"
             + " || { echo \"couldn't rename it\" >&2; exit 1; }";
     }
 
-    void RunThenRelist(string cmd, string showSub)
+    void RunThenRelist(string cmd, string showPath)
     {
         string host = hostName;
         new Thread(delegate ()
@@ -1038,10 +1289,84 @@ class UploadForm : Form
             UI(delegate
             {
                 if (error != null) MessageBox.Show(this, "That didn't work on the headset:\n\n" + error, Text);
-                else subfolder.Text = showSub;
-                ListFolder();
+                ListPath(error == null ? showPath : CurrentDir());
             });
         }) { IsBackground = true }.Start();
+    }
+
+    // ---- Headset -> PC ----
+
+    // Copies the selected files and folders (with everything in them) to a
+    // folder on the PC, through the same queue as uploads. Files already
+    // there are skipped, not overwritten.
+    void DownloadSelected()
+    {
+        var entries = SelectedEntries();
+        if (entries.Count == 0)
+        {
+            MessageBox.Show(this, "Select the files or folders to copy in the headset view first.", Text);
+            return;
+        }
+        string dir = CurrentDir(), to;
+        using (var dlg = new FolderBrowserDialog { ShowNewFolderButton = true,
+            Description = "Copy " + (entries.Count == 1 ? "\"" + entries[0].Name + "\"" : entries.Count + " items")
+                + " from the headset into this PC folder:" })
+        {
+            if (lastLocalDir != null) dlg.SelectedPath = lastLocalDir;
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+            to = lastLocalDir = dlg.SelectedPath;
+        }
+        DownloadTo(dir, entries, to);
+    }
+
+    void DownloadTo(string dir, List<Entry> entries, string to)
+    {
+        // One find lists every file to copy with its size; -H follows a
+        // selected item that is a link (to a file or a folder), and ./ keeps
+        // a name starting with - from reading as an option.
+        var cmd = new StringBuilder("cd " + ShellPath(dir) + " && find -H");
+        foreach (var e in entries) cmd.Append(' ').Append(Sh("./" + e.Name));
+        cmd.Append(" -type f ! -name '.*.part' -printf '%s\\t%p\\n'");
+        string host = hostName;
+        status.Text = "Finding the files to copy...";
+        new Thread(delegate ()
+        {
+            string output;
+            string error = RunRemote(cmd.ToString(), host, 5, out output);
+            var jobs = new List<Job>();
+            var problems = new List<string>();
+            if (error != null) problems.Add(error); // e.g. a folder it can't read; the rest still go
+            foreach (var line in output.Replace("\r", "").Split('\n'))
+            {
+                var f = line.Split(new[] { '\t' }, 2);
+                long size;
+                if (f.Length < 2 || !long.TryParse(f[0], out size)) continue;
+                string rel = f[1].StartsWith("./") ? f[1].Substring(2) : f[1];
+                string local = LocalPath(to, rel);
+                if (local == null) { problems.Add(rel + ": the name can't be used on Windows"); continue; }
+                jobs.Add(new Job { Down = true, Remote = Join(dir, rel), Local = local, Size = size, Label = "to PC: " + rel });
+            }
+            UI(delegate
+            {
+                foreach (var pr in problems) list.Items.Add("    skipped " + pr);
+                if (Enqueue(jobs) == 0) status.Text = problems.Count > 0 ? "Nothing copied (see list)." : "Nothing to copy (no files in there).";
+            });
+        }) { IsBackground = true }.Start();
+    }
+
+    // Where a headset file (path relative to the folder on show) lands
+    // under `root`; null when a part of its name isn't allowed on Windows.
+    static string LocalPath(string root, string rel)
+    {
+        var bad = Path.GetInvalidFileNameChars();
+        string local = root;
+        foreach (var part in rel.Split('/'))
+        {
+            if (part.Length == 0 || part == ".") continue;
+            if (part == ".." || part.IndexOfAny(bad) >= 0 || part.EndsWith(".") || part.EndsWith(" ")) return null;
+            local = Path.Combine(local, part);
+        }
+        return local;
     }
 
     static string Human(long b)

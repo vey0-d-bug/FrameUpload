@@ -1,5 +1,27 @@
 # FrameUpload patch notes
 
+## v6 (2026-10-31)
+
+**Whole-headset file browser**
+- The headset view is no longer limited to `~/Videos`. The **Copy to** box takes any headset folder: `~/...`, `/...`, or a name inside the folder on show (`..` works, also above `~`). Enter opens it; **Up** goes all the way to `/`.
+- **Places** jumps to Videos, Home, Downloads, SD card / USB (`/run/media`) or the whole headset (`/`).
+- **Show hidden** lists dot files and folders (greyed). The `.part` of a copy under way stays hidden.
+- Copies go to whatever folder is on show. The FrameCinema Library hint only shows for copies into `~/Videos`.
+- The line under the list shows the free space where you are and says when a folder is read-only; a folder you can't open says so.
+- Folder sizes are worked out in the home folder and on drives only, at most 3 s per folder and 4 s in all, so big trees and `/` still list fast.
+
+**Download to the PC**
+- New **Download...** copies the selected files or folders (everything in them, following a selected link) into a PC folder you pick, through the same queue and progress bars as uploads.
+- Files already in that PC folder are left as they are and counted as such. Names Windows can't hold are listed and skipped.
+- Each file is written as `name.part` and renamed once its size matches; a quit mid-copy removes the `.part`.
+
+**Safety**
+- Delete and rename work only in the home folder and on SD cards and USB drives (greyed out elsewhere), and never on hidden items right in `~`, where the headset's settings and this tool's ssh key live.
+- Deleting outside `~/Videos` adds a line saying so to the confirmation. The extension and hidden-name checks of v5 stay for `~/Videos`, where FrameCinema reads them.
+
+**Other**
+- New `--dir=PATH` starts in any headset folder (`--sub=` still means under `~/Videos`).
+
 ## v5 (2026-10-31)
 
 - **Rename...** (or F2) in the headset view renames the selected file or folder. The box starts with the name selected up to its extension, and the item stays selected after the view refreshes.
