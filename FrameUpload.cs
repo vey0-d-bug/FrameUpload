@@ -11,6 +11,7 @@
 // headset when the "frame" entry stops working (mDNS for frame.local drops
 // out at times): it tries the entry, then the last IP that worked, then
 // frame.local, and asks for an IP. Copies go to whichever address connected.
+// v4: the headset view sorts by a clicked column and shows folder sizes (du).
 // Build: build.cmd (uses the .NET Framework csc.exe that ships with Windows).
 using System;
 using System.Collections.Generic;
@@ -161,6 +162,8 @@ class UploadForm : Form
         remote.Columns.Add("Size", 90, HorizontalAlignment.Right);
         remote.Columns.Add("Modified", 130);
         remote.ItemActivate += delegate { OpenSelected(); };
+        remote.ColumnClick += (s, e) => SortBy(e.Column);
+        remote.ListViewItemSorter = sorter;
         remote.KeyDown += (s, e) =>
         {
             if (e.KeyCode == Keys.Back) GoUp();
@@ -740,6 +743,50 @@ class UploadForm : Form
     {
         public string Name;
         public bool Dir;
+        public long Size = -1;   // a folder's is -1 when du didn't report it
+        public double Time;
+    }
+
+    // Folders stay above files; within each, by the clicked column.
+    class EntrySorter : System.Collections.IComparer
+    {
+        public int Column;
+        public bool Descending;
+        public int Compare(object x, object y)
+        {
+            var a = ((ListViewItem)x).Tag as Entry;
+            var b = ((ListViewItem)y).Tag as Entry;
+            if (a == null || b == null) return 0;
+            if (a.Dir != b.Dir) return a.Dir ? -1 : 1;
+            int c = Column == 1 ? a.Size.CompareTo(b.Size)
+                : Column == 2 ? a.Time.CompareTo(b.Time)
+                : 0;
+            if (c == 0) c = string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
+            return Descending ? -c : c;
+        }
+    }
+
+    readonly EntrySorter sorter = new EntrySorter();
+    readonly string[] columnTitles = { "", "Size", "Modified" };
+
+    // A click sorts by that column; a second click on it flips the order.
+    // Size and date start biggest/newest first.
+    void SortBy(int column)
+    {
+        if (sorter.Column == column) sorter.Descending = !sorter.Descending;
+        else
+        {
+            sorter.Column = column;
+            sorter.Descending = column != 0;
+        }
+        remote.Sort();
+        ShowSortArrow();
+    }
+
+    void ShowSortArrow()
+    {
+        for (int i = 0; i < remote.Columns.Count; i++)
+            remote.Columns[i].Text = columnTitles[i] + (i == sorter.Column ? (sorter.Descending ? "  ▼" : "  ▲") : "");
     }
 
     static string RemoteDir(string sub) { return "$HOME/Videos" + (sub.Length > 0 ? "/" + Sh(sub) : ""); }
@@ -768,7 +815,9 @@ class UploadForm : Form
         string host = hostName;
         string cmd = "d=" + RemoteDir(sub) + "; [ -d \"$d\" ] || { echo MISSING; exit 0; }; cd \"$d\""
             + " && df -B1 --output=avail . | tail -n 1"
-            + " && find . -mindepth 1 -maxdepth 1 ! -name '.*' -printf '%Y\\t%s\\t%T@\\t%f\\n'";
+            + " && find . -mindepth 1 -maxdepth 1 ! -name '.*' -printf '%Y\\t%s\\t%T@\\t%f\\n'"
+            // Folder sizes: du reads only metadata, well under a second for ~/Videos.
+            + " && echo SIZES && { find . -mindepth 1 -maxdepth 1 -type d ! -name '.*' -exec du -s --apparent-size -B1 {} + 2>/dev/null; true; }";
         remoteInfo.Text = "Listing ~/Videos" + (sub.Length > 0 ? "/" + sub : "") + "...";
         new Thread(delegate ()
         {
@@ -786,7 +835,8 @@ class UploadForm : Form
         string where = "~/Videos" + (sub.Length > 0 ? "/" + sub : "");
         remote.BeginUpdate();
         remote.Items.Clear();
-        remote.Columns[0].Text = where;
+        columnTitles[0] = where;
+        ShowSortArrow();
         if (error != null)
         {
             remote.Items.Add(new ListViewItem("Can't list it: " + error) { ForeColor = Color.Firebrick });
@@ -803,7 +853,17 @@ class UploadForm : Form
             var folders = new List<ListViewItem>();
             var files = new List<ListViewItem>();
             long total = 0, free;
-            for (int i = 1; i < lines.Length; i++)
+            // du's "bytes<TAB>./name" lines after the SIZES marker.
+            var dirSizes = new Dictionary<string, long>();
+            int mark = Array.IndexOf(lines, "SIZES");
+            if (mark < 0) mark = lines.Length;
+            for (int i = mark + 1; i < lines.Length; i++)
+            {
+                var d = lines[i].Split(new[] { '\t' }, 2);
+                long n;
+                if (d.Length == 2 && d[1].StartsWith("./") && long.TryParse(d[0], out n)) dirSizes[d[1].Substring(2)] = n;
+            }
+            for (int i = 1; i < mark; i++)
             {
                 var f = lines[i].Split(new[] { '\t' }, 4);
                 if (f.Length < 4 || f[3].Length == 0) continue;
@@ -813,16 +873,14 @@ class UploadForm : Form
                 long.TryParse(f[1], out size);
                 double.TryParse(f[2], System.Globalization.NumberStyles.Float,
                     System.Globalization.CultureInfo.InvariantCulture, out t);
+                if (dir && !dirSizes.TryGetValue(f[3], out size)) size = -1;
                 var item = new ListViewItem(dir ? f[3] + "/" : f[3]);
-                item.SubItems.Add(dir ? "folder" : Human(size));
+                item.SubItems.Add(size < 0 ? "folder" : Human(size));
                 item.SubItems.Add(new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(t).ToLocalTime().ToString("yyyy-MM-dd HH:mm"));
-                item.Tag = new Entry { Name = f[3], Dir = dir };
+                item.Tag = new Entry { Name = f[3], Dir = dir, Size = size, Time = t };
                 (dir ? folders : files).Add(item);
-                if (!dir) total += size;
+                if (size > 0) total += size;
             }
-            Comparison<ListViewItem> byName = (a, b) => string.Compare(a.Text, b.Text, StringComparison.OrdinalIgnoreCase);
-            folders.Sort(byName);
-            files.Sort(byName);
             remote.Items.AddRange(folders.ToArray());
             remote.Items.AddRange(files.ToArray());
             if (remote.Items.Count == 0)

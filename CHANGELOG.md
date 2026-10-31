@@ -1,5 +1,10 @@
 # FrameUpload patch notes
 
+## v4 (2026-10-31)
+
+- Click a column header in the headset view to sort by name, size or date; click it again to flip the order. Size and date start biggest/newest first. Folders stay above files.
+- Folders show their size (everything in them) as soon as the folder loads, and the total under the list counts them.
+
 ## v3 (2026-10-31)
 
 **Headset view**
