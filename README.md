@@ -44,4 +44,4 @@ Measured on the test PC (2.5 GbE wired) to the Frame (5 GHz, 80 MHz), 1 GiB of r
 
 ## Build
 
-Run `build.cmd`. It uses the .NET Framework `csc.exe` that ships with Windows (no SDK needed) and writes `C:\dev\FrameUpload\FrameUpload.exe`.
+Run `build.cmd` (or `build.cmd OUTPUT_FOLDER`). It uses the .NET Framework `csc.exe` that ships with Windows (no SDK needed) and writes `FrameUpload.exe` next to the script by default.
