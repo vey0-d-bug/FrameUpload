@@ -1,5 +1,7 @@
 # FrameUpload
 
+[Patch notes](CHANGELOG.md)
+
 Tiny Windows debug tool that copies videos and pictures from the PC to the Steam Frame's `~/Videos` folder, which FrameCinema's Library scans.
 
 - Drag files onto the window (or the exe), or click **Add files...**.
