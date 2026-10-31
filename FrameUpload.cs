@@ -6,6 +6,11 @@
 // ~70 on several. So v2 prefers Git for Windows' ssh.exe when it is installed
 // and sends big files as several byte ranges at once, each over its own ssh
 // connection, written into place on the headset with dd.
+// v3: a view of the headset's ~/Videos (browse, pick the destination folder,
+// make folders, delete) and a "Connect to Frame" button that finds the
+// headset when the "frame" entry stops working (mDNS for frame.local drops
+// out at times): it tries the entry, then the last IP that worked, then
+// frame.local, and asks for an IP. Copies go to whichever address connected.
 // Build: build.cmd (uses the .NET Framework csc.exe that ships with Windows).
 using System;
 using System.Collections.Generic;
@@ -69,6 +74,22 @@ class UploadForm : Form
     readonly ProgressBar totalBar = new ProgressBar();
     readonly Label status = new Label();
     readonly Button addButton = new Button();
+    readonly Button connectButton = new Button();
+    readonly Button ipButton = new Button();
+    readonly Label connLabel = new Label();
+    readonly ListView remote = new ListView();
+    readonly Button upButton = new Button();
+    readonly Button refreshButton = new Button();
+    readonly Button newFolderButton = new Button();
+    readonly Button deleteButton = new Button();
+    readonly Label remoteInfo = new Label();
+    readonly ToolTip tips = new ToolTip();
+    // The HostName that connected, passed to ssh as -o HostName= so the
+    // "frame" entry's user and keys still apply; null: the entry as it is.
+    volatile string hostName;
+    int connecting;      // 1 while a connect runs
+    int listSeq;         // drops listings that a newer one overtook
+    string listedSub;    // the folder the view shows
     readonly Queue<string> queue = new Queue<string>();
     readonly object queueLock = new object();
     bool busy;
@@ -89,48 +110,113 @@ class UploadForm : Form
         subfolder.Text = o.Sub;
         if (o.Files.Count > 0) Shown += delegate { Enqueue(o.Files.ToArray()); };
         Text = "Frame Upload";
-        ClientSize = new Size(560, 380);
-        MinimumSize = new Size(420, 300);
+        ClientSize = new Size(640, 640);
+        MinimumSize = new Size(520, 480);
         AllowDrop = true;
         Font = new Font("Segoe UI", 9f);
 
-        var dest = new Label { Text = "Copy to " + o.Host + ":  ~/Videos/", AutoSize = true, Location = new Point(12, 15) };
-        subfolder.Location = new Point(200, 12);
-        subfolder.Width = 200;
+        connectButton.Text = "Connect to Frame";
+        connectButton.Size = new Size(130, 28);
+        connectButton.Location = new Point(12, 10);
+        connectButton.Click += delegate { Connect(null, true); };
+        ipButton.Text = "Set IP...";
+        ipButton.Size = new Size(75, 28);
+        ipButton.Location = new Point(148, 10);
+        ipButton.Click += delegate { AskForIp(null); };
+        connLabel.Location = new Point(232, 16);
+        connLabel.Size = new Size(396, 20);
+        connLabel.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+        connLabel.AutoEllipsis = true;
+        connLabel.Text = "Not connected yet.";
+
+        // The folder the view shows is the one files are copied to.
+        var dest = new Label { Text = "Copy to  ~/Videos/", AutoSize = true, Location = new Point(12, 53) };
+        subfolder.Location = new Point(118, 50);
+        subfolder.Width = 230;
         subfolder.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
-        var hint = new Label { Text = "(blank = ~/Videos)", AutoSize = true, ForeColor = SystemColors.GrayText,
-            Location = new Point(410, 15), Anchor = AnchorStyles.Top | AnchorStyles.Right };
+        subfolder.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; ListFolder(); } };
+        var x = 628;
+        foreach (var b in new[] { deleteButton, newFolderButton, refreshButton, upButton })
+        {
+            b.Size = new Size(b == newFolderButton ? 84 : 64, 26);
+            x -= b.Width;
+            b.Location = new Point(x, 48);
+            b.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            x -= 4;
+        }
+        upButton.Text = "Up";
+        upButton.Click += delegate { GoUp(); };
+        refreshButton.Text = "Refresh";
+        refreshButton.Click += delegate { ListFolder(); };
+        newFolderButton.Text = "New folder...";
+        newFolderButton.Click += delegate { NewFolder(); };
+        deleteButton.Text = "Delete...";
+        deleteButton.Click += delegate { DeleteSelected(); };
 
-        list.Location = new Point(12, 44);
-        list.Size = new Size(536, 200);
-        list.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+        remote.View = View.Details;
+        remote.FullRowSelect = true;
+        remote.HideSelection = false;
+        remote.Dock = DockStyle.Fill;
+        remote.Columns.Add("On the headset", 330);
+        remote.Columns.Add("Size", 90, HorizontalAlignment.Right);
+        remote.Columns.Add("Modified", 130);
+        remote.ItemActivate += delegate { OpenSelected(); };
+        remote.KeyDown += (s, e) =>
+        {
+            if (e.KeyCode == Keys.Back) GoUp();
+            else if (e.KeyCode == Keys.Delete) DeleteSelected();
+            else if (e.KeyCode == Keys.F5) ListFolder();
+        };
+
+        list.Dock = DockStyle.Fill;
         list.HorizontalScrollbar = true;
+        list.IntegralHeight = false;
 
-        fileBar.Location = new Point(12, 254);
-        fileBar.Size = new Size(536, 18);
+        var split = new SplitContainer
+        {
+            Orientation = Orientation.Horizontal,
+            Location = new Point(12, 80),
+            Size = new Size(616, 424),
+            Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
+            SplitterDistance = 270,
+            SplitterWidth = 6,
+        };
+        remoteInfo.Dock = DockStyle.Bottom;
+        remoteInfo.Height = 22;
+        remoteInfo.TextAlign = ContentAlignment.MiddleLeft;
+        remoteInfo.ForeColor = SystemColors.GrayText;
+        split.Panel1.Controls.Add(remote);
+        split.Panel1.Controls.Add(remoteInfo);
+        remote.BringToFront(); // fill what the info line leaves
+        split.Panel2.Controls.Add(list);
+
+        fileBar.Location = new Point(12, 514);
+        fileBar.Size = new Size(616, 18);
         fileBar.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
-        totalBar.Location = new Point(12, 278);
-        totalBar.Size = new Size(536, 18);
+        totalBar.Location = new Point(12, 538);
+        totalBar.Size = new Size(616, 18);
         totalBar.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
 
-        status.Location = new Point(12, 304);
-        status.Size = new Size(536, 34);
+        status.Location = new Point(12, 564);
+        status.Size = new Size(616, 34);
         status.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
         status.Text = "Drag videos or pictures here, or click Add files.";
 
-        var via = new Label { AutoSize = true, ForeColor = SystemColors.GrayText, Location = new Point(12, 349),
+        var via = new Label { AutoSize = true, ForeColor = SystemColors.GrayText, Location = new Point(12, 609),
             Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
             Text = "via " + (gitSsh ? "Git's ssh" : "Windows' ssh (slow: install Git for Windows for ~4x)")
                 + ", up to " + streams + " streams" };
 
         addButton.Text = "Add files...";
         addButton.Size = new Size(110, 28);
-        addButton.Location = new Point(438, 342);
+        addButton.Location = new Point(518, 602);
         addButton.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
         addButton.Click += delegate { PickFiles(); };
 
         fileBar.Maximum = totalBar.Maximum = 1000;
-        Controls.AddRange(new Control[] { dest, subfolder, hint, list, fileBar, totalBar, status, via, addButton });
+        Controls.AddRange(new Control[] { connectButton, ipButton, connLabel, dest, subfolder,
+            upButton, refreshButton, newFolderButton, deleteButton, split, fileBar, totalBar, status, via, addButton });
+        Shown += delegate { Connect(null, false); };
 
         DragEnter += (s, e) => e.Effect = e.Data.GetDataPresent(DataFormats.FileDrop) ? DragDropEffects.Copy : DragDropEffects.None;
         DragDrop += (s, e) => Enqueue((string[])e.Data.GetData(DataFormats.FileDrop));
@@ -226,6 +312,7 @@ class UploadForm : Form
                 ? "Done: " + doneCount + " file(s) copied. They show up in FrameCinema's Library."
                 : "Finished with errors: " + doneCount + " copied, " + failCount + " failed (see list).";
             if (opt.Exit) { Close(); return; }
+            ListFolder();
             (failCount == 0 ? SystemSounds.Asterisk : SystemSounds.Hand).Play();
         });
     }
@@ -389,11 +476,21 @@ class UploadForm : Form
     // Runs a command on the headset with no input; null when it succeeds.
     string RunRemote(string remote)
     {
+        string output;
+        return RunRemote(remote, hostName, 10, out output);
+    }
+
+    // Same, keeping what the command prints, against `host` (null: the
+    // "frame" entry as it is) with a connect timeout in seconds.
+    string RunRemote(string remote, string host, int timeout, out string output)
+    {
         var stderr = new StringBuilder();
-        using (var proc = StartSsh(remote, stderr))
+        var stdout = new StringBuilder();
+        using (var proc = StartSsh(remote, stderr, stdout, host, timeout))
         {
             proc.StandardInput.Close();
             proc.WaitForExit();
+            lock (stdout) output = stdout.ToString();
             if (proc.ExitCode == 0) return null;
             string why;
             lock (stderr) why = stderr.ToString().Trim();
@@ -403,17 +500,28 @@ class UploadForm : Form
 
     Process StartSsh(string remote, StringBuilder stderr)
     {
+        return StartSsh(remote, stderr, null, hostName, 10);
+    }
+
+    Process StartSsh(string remote, StringBuilder stderr, StringBuilder stdout, string host, int timeout)
+    {
         // AES-GCM first: both ends have AES instructions, and it beat
-        // chacha20 on the Frame (55 vs 50 MB/s on one stream).
+        // chacha20 on the Frame (55 vs 50 MB/s on one stream). A HostName
+        // from Connect replaces only the entry's address; accept-new lets a
+        // new IP of the headset in but still refuses a changed host key.
         var psi = new ProcessStartInfo(sshExe,
-            "-o BatchMode=yes -o ConnectTimeout=10 -c aes128-gcm@openssh.com,chacha20-poly1305@openssh.com "
-            + opt.Host + " \"" + remote + "\"")
+            "-o BatchMode=yes -o ConnectTimeout=" + timeout + " -o StrictHostKeyChecking=accept-new"
+            + (host != null ? " -o HostName=" + host : "")
+            + " -c aes128-gcm@openssh.com,chacha20-poly1305@openssh.com "
+            + opt.Host + " " + WinArg(remote))
         {
             UseShellExecute = false,
             CreateNoWindow = true,
             RedirectStandardInput = true,
             RedirectStandardError = true,
             RedirectStandardOutput = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
         };
         // Git's ssh finds ~/.ssh (config, keys, known_hosts) through HOME,
         // which is unset outside Git Bash.
@@ -426,7 +534,7 @@ class UploadForm : Form
         lock (live) live.Add(proc);
         proc.Start();
         proc.ErrorDataReceived += (s, e) => { if (e.Data != null) lock (stderr) stderr.AppendLine(e.Data); };
-        proc.OutputDataReceived += (s, e) => { };
+        proc.OutputDataReceived += (s, e) => { if (e.Data != null && stdout != null) lock (stdout) stdout.AppendLine(e.Data); };
         proc.BeginErrorReadLine();
         proc.BeginOutputReadLine();
         return proc;
@@ -460,6 +568,25 @@ class UploadForm : Form
     // Single-quote for the remote POSIX shell.
     static string Sh(string s) { return "'" + s.Replace("'", "'\\''") + "'"; }
 
+    // Quotes one argument for the Windows command line (the C runtime's
+    // rules, which both ssh builds follow), so the remote command reaches
+    // ssh whole, double quotes and runs of spaces included.
+    static string WinArg(string s)
+    {
+        var sb = new StringBuilder("\"");
+        int slashes = 0;
+        foreach (char c in s)
+        {
+            if (c == '\\') { slashes++; continue; }
+            if (c == '"') sb.Append('\\', slashes * 2 + 1);
+            else sb.Append('\\', slashes);
+            sb.Append(c);
+            slashes = 0;
+        }
+        sb.Append('\\', slashes * 2).Append('"');
+        return sb.ToString();
+    }
+
     static string Mb(long b) { return (b / 1048576.0).ToString("0.0") + " MB"; }
 
     // --ssh=PATH, else Git for Windows' ssh (OpenSSH 10, ~4x Windows' own
@@ -484,6 +611,312 @@ class UploadForm : Form
         if (File.Exists(w)) return w;
         w = Path.Combine(win, @"Sysnative\OpenSSH\ssh.exe");
         return File.Exists(w) ? w : "ssh.exe";
+    }
+
+    // ---- Connect to Frame ----
+
+    static string SavedIpFile
+    {
+        get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), @"FrameUpload\host.txt"); }
+    }
+
+    static string LoadSavedIp()
+    {
+        try { return File.ReadAllText(SavedIpFile).Trim(); } catch (Exception) { return ""; }
+    }
+
+    static void SaveIp(string ip)
+    {
+        try { Directory.CreateDirectory(Path.GetDirectoryName(SavedIpFile)); File.WriteAllText(SavedIpFile, ip); }
+        catch (Exception) { } // only a convenience for next time
+    }
+
+    // Host names and IPs only: it goes on ssh's command line.
+    static bool ValidHost(string h)
+    {
+        if (h.Length == 0 || h.Length > 253 || h[0] == '-') return false;
+        foreach (char c in h)
+            if (!(c < 128 && char.IsLetterOrDigit(c)) && c != '.' && c != '-' && c != ':' && c != '_') return false;
+        return true;
+    }
+
+    // Tries `only` when given, else the "frame" entry as it is, the last IP
+    // that worked, then frame.local; `ask` offers to type an IP when none
+    // answers. The headset's own address (from $SSH_CONNECTION) is saved
+    // whichever way it connected, so the next fallback is fresh.
+    void Connect(string only, bool ask)
+    {
+        if (Interlocked.Exchange(ref connecting, 1) == 1) return;
+        connectButton.Enabled = ipButton.Enabled = false;
+        var tries = new List<string>();
+        if (only != null) tries.Add(only);
+        else
+        {
+            tries.Add(null);
+            string saved = LoadSavedIp();
+            if (ValidHost(saved)) tries.Add(saved);
+            tries.Add("frame.local");
+        }
+        new Thread(delegate ()
+        {
+            string firstError = null, ip = null, worked = null;
+            bool ok = false;
+            foreach (var h in tries)
+            {
+                string name = h ?? opt.Host;
+                UI(delegate { SetConn("Trying " + name + "...", SystemColors.GrayText); });
+                string output;
+                string error = RunRemote("echo $SSH_CONNECTION", h, 5, out output);
+                if (error == null)
+                {
+                    ok = true;
+                    worked = h;
+                    var f = output.Trim().Split(' ');
+                    if (f.Length >= 3 && ValidHost(f[2])) ip = f[2];
+                    break;
+                }
+                if (firstError == null) firstError = name + ": " + error;
+            }
+            UI(delegate
+            {
+                Interlocked.Exchange(ref connecting, 0);
+                connectButton.Enabled = ipButton.Enabled = true;
+                if (ok)
+                {
+                    hostName = worked;
+                    if (ip != null) SaveIp(ip);
+                    string name = worked ?? opt.Host;
+                    SetConn("Connected to " + name + (ip != null && ip != name ? " (" + ip + ")" : ""), Color.ForestGreen);
+                    ListFolder();
+                }
+                else
+                {
+                    SetConn("Not connected. " + firstError, Color.Firebrick);
+                    if (ask) AskForIp(firstError);
+                }
+            });
+        }) { IsBackground = true }.Start();
+    }
+
+    void AskForIp(string why)
+    {
+        if (why != null && why.Length > 200) why = why.Substring(0, 200) + "...";
+        string ip = Prompt("Frame IP address", (why != null ? "Couldn't reach the Frame (" + why + ").\n\n" : "")
+            + "The headset's IP address (your router lists it). It is saved for next time once it connects.",
+            LoadSavedIp());
+        if (ip == null) return;
+        ip = ip.Trim();
+        if (!ValidHost(ip)) { MessageBox.Show(this, "\"" + ip + "\" isn't an IP address or host name.", Text); return; }
+        Connect(ip, true);
+    }
+
+    void SetConn(string text, Color color)
+    {
+        connLabel.Text = text;
+        connLabel.ForeColor = color;
+        tips.SetToolTip(connLabel, text);
+    }
+
+    string Prompt(string title, string text, string value)
+    {
+        using (var f = new Form { Text = title, FormBorderStyle = FormBorderStyle.FixedDialog, MinimizeBox = false,
+            MaximizeBox = false, ShowInTaskbar = false, StartPosition = FormStartPosition.CenterParent,
+            ClientSize = new Size(400, 170), Font = Font })
+        {
+            var label = new Label { Text = text, Location = new Point(12, 12), Size = new Size(376, 84) };
+            var box = new TextBox { Text = value ?? "", Location = new Point(12, 100), Width = 376 };
+            var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Location = new Point(232, 134), Size = new Size(75, 26) };
+            var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Location = new Point(313, 134), Size = new Size(75, 26) };
+            f.Controls.AddRange(new Control[] { label, box, ok, cancel });
+            f.AcceptButton = ok;
+            f.CancelButton = cancel;
+            return f.ShowDialog(this) == DialogResult.OK ? box.Text : null;
+        }
+    }
+
+    // ---- The headset's ~/Videos ----
+
+    class Entry
+    {
+        public string Name;
+        public bool Dir;
+    }
+
+    static string RemoteDir(string sub) { return "$HOME/Videos" + (sub.Length > 0 ? "/" + Sh(sub) : ""); }
+
+    static string Join(string sub, string name) { return sub.Length > 0 ? sub + "/" + name : name; }
+
+    // The folder on show, else the one typed in the box.
+    string CurrentSub()
+    {
+        string sub;
+        if (listedSub != null) return listedSub;
+        return TryCleanSubfolder(subfolder.Text, out sub) ? sub : "";
+    }
+
+    // Lists the folder in the box (hidden names, like the .part files of
+    // copies under way, are left out) and the free space on the headset.
+    void ListFolder()
+    {
+        string sub;
+        if (!TryCleanSubfolder(subfolder.Text, out sub))
+        {
+            MessageBox.Show(this, "The subfolder name can't contain \"..\" or start with ~.", Text);
+            return;
+        }
+        int seq = ++listSeq;
+        string host = hostName;
+        string cmd = "d=" + RemoteDir(sub) + "; [ -d \"$d\" ] || { echo MISSING; exit 0; }; cd \"$d\""
+            + " && df -B1 --output=avail . | tail -n 1"
+            + " && find . -mindepth 1 -maxdepth 1 ! -name '.*' -printf '%Y\\t%s\\t%T@\\t%f\\n'";
+        remoteInfo.Text = "Listing ~/Videos" + (sub.Length > 0 ? "/" + sub : "") + "...";
+        new Thread(delegate ()
+        {
+            string output;
+            string error = RunRemote(cmd, host, 5, out output);
+            UI(delegate { if (seq == listSeq) ShowListing(sub, error, output); });
+        }) { IsBackground = true }.Start();
+    }
+
+    void ShowListing(string sub, string error, string output)
+    {
+        listedSub = sub;
+        subfolder.Text = sub;
+        upButton.Enabled = sub.Length > 0;
+        string where = "~/Videos" + (sub.Length > 0 ? "/" + sub : "");
+        remote.BeginUpdate();
+        remote.Items.Clear();
+        remote.Columns[0].Text = where;
+        if (error != null)
+        {
+            remote.Items.Add(new ListViewItem("Can't list it: " + error) { ForeColor = Color.Firebrick });
+            remoteInfo.Text = "Not connected? Try Connect to Frame.";
+        }
+        else if (output.Trim() == "MISSING")
+        {
+            remote.Items.Add(new ListViewItem("(no such folder yet: copying here makes it)") { ForeColor = SystemColors.GrayText });
+            remoteInfo.Text = "";
+        }
+        else
+        {
+            var lines = output.Replace("\r", "").Split('\n');
+            var folders = new List<ListViewItem>();
+            var files = new List<ListViewItem>();
+            long total = 0, free;
+            for (int i = 1; i < lines.Length; i++)
+            {
+                var f = lines[i].Split(new[] { '\t' }, 4);
+                if (f.Length < 4 || f[3].Length == 0) continue;
+                bool dir = f[0] == "d";
+                long size;
+                double t;
+                long.TryParse(f[1], out size);
+                double.TryParse(f[2], System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out t);
+                var item = new ListViewItem(dir ? f[3] + "/" : f[3]);
+                item.SubItems.Add(dir ? "folder" : Human(size));
+                item.SubItems.Add(new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(t).ToLocalTime().ToString("yyyy-MM-dd HH:mm"));
+                item.Tag = new Entry { Name = f[3], Dir = dir };
+                (dir ? folders : files).Add(item);
+                if (!dir) total += size;
+            }
+            Comparison<ListViewItem> byName = (a, b) => string.Compare(a.Text, b.Text, StringComparison.OrdinalIgnoreCase);
+            folders.Sort(byName);
+            files.Sort(byName);
+            remote.Items.AddRange(folders.ToArray());
+            remote.Items.AddRange(files.ToArray());
+            if (remote.Items.Count == 0)
+                remote.Items.Add(new ListViewItem("(empty)") { ForeColor = SystemColors.GrayText });
+            remoteInfo.Text = (folders.Count > 0 ? folders.Count + " folder(s), " : "") + files.Count + " file(s), " + Human(total)
+                + (long.TryParse(lines[0].Trim(), out free) ? "   |   " + Human(free) + " free on the headset" : "");
+        }
+        remote.EndUpdate();
+    }
+
+    void OpenSelected()
+    {
+        if (remote.SelectedItems.Count != 1) return;
+        var e = remote.SelectedItems[0].Tag as Entry;
+        if (e == null || !e.Dir) return;
+        subfolder.Text = Join(CurrentSub(), e.Name);
+        ListFolder();
+    }
+
+    void GoUp()
+    {
+        string sub = CurrentSub();
+        if (sub.Length == 0) return;
+        int slash = sub.LastIndexOf('/');
+        subfolder.Text = slash < 0 ? "" : sub.Substring(0, slash);
+        ListFolder();
+    }
+
+    void NewFolder()
+    {
+        string sub = CurrentSub();
+        string name = Prompt("New folder", "Make a folder in ~/Videos" + (sub.Length > 0 ? "/" + sub : "") + " named:", "");
+        if (name == null) return;
+        name = name.Trim();
+        if (name.Length == 0 || name == "." || name == ".." || name.IndexOfAny(new[] { '/', '\\' }) >= 0)
+        {
+            MessageBox.Show(this, "A folder name can't be empty, \".\" or \"..\", or contain / or \\.", Text);
+            return;
+        }
+        string target = Join(sub, name);
+        RunThenRelist("mkdir -p " + RemoteDir(target), target);
+    }
+
+    // Asks first: names the items, says folders go with everything in them.
+    void DeleteSelected()
+    {
+        var entries = new List<Entry>();
+        foreach (ListViewItem item in remote.SelectedItems)
+        {
+            var e = item.Tag as Entry;
+            if (e != null && e.Name != "." && e.Name != ".." && e.Name.IndexOf('/') < 0) entries.Add(e);
+        }
+        if (entries.Count == 0) return;
+        string sub = CurrentSub();
+        var names = new StringBuilder();
+        bool anyDir = false;
+        for (int i = 0; i < entries.Count; i++)
+        {
+            if (entries[i].Dir) anyDir = true;
+            if (i < 12) names.Append("    ").Append(entries[i].Name).Append(entries[i].Dir ? "/" : "").Append('\n');
+        }
+        if (entries.Count > 12) names.Append("    ...and ").Append(entries.Count - 12).Append(" more\n");
+        if (MessageBox.Show(this, "Delete " + (entries.Count == 1 ? "this" : "these " + entries.Count) + " from the headset's ~/Videos"
+                + (sub.Length > 0 ? "/" + sub : "") + "?\n\n" + names
+                + (anyDir ? "\nFolders are deleted with everything in them." : "") + "\nThis can't be undone.",
+                Text, MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+            return;
+        var cmd = new StringBuilder("cd " + RemoteDir(sub) + " && rm -rf --");
+        foreach (var e in entries) cmd.Append(' ').Append(Sh(e.Name));
+        RunThenRelist(cmd.ToString(), sub);
+    }
+
+    void RunThenRelist(string cmd, string showSub)
+    {
+        string host = hostName;
+        new Thread(delegate ()
+        {
+            string output;
+            string error = RunRemote(cmd, host, 5, out output);
+            UI(delegate
+            {
+                if (error != null) MessageBox.Show(this, "That didn't work on the headset:\n\n" + error, Text);
+                else subfolder.Text = showSub;
+                ListFolder();
+            });
+        }) { IsBackground = true }.Start();
+    }
+
+    static string Human(long b)
+    {
+        if (b < 1024) return b + " B";
+        if (b < 1048576) return (b / 1024.0).ToString("0.0") + " KB";
+        if (b < 1L << 30) return (b / 1048576.0).ToString("0.0") + " MB";
+        return (b / 1073741824.0).ToString("0.00") + " GB";
     }
 
     void MarkItem(string name, string tag)
