@@ -16,9 +16,10 @@
 // path box, Places, hidden files), copies go to the folder on show, and
 // Download... copies headset files and folders back to the PC. Delete and
 // rename stay inside the home folder and removable drives.
-// v7: Install app... sideloads apps: .apk, Windows .exe and AppImage files
+// v7: Apps > Install app... sideloads apps: .apk, Windows .exe and AppImage files
 // are copied to ~/Applications and added to the Steam library; Flatpak
 // bundles and .flatpakref files are installed with flatpak --user.
+// Apps > Manage installed apps... lists them and uninstalls them.
 // Build: build.cmd (uses the .NET Framework csc.exe that ships with Windows).
 using System;
 using System.Collections.Generic;
@@ -248,7 +249,7 @@ class UploadForm : Form
         status.Location = new Point(12, 564);
         status.Size = new Size(616, 34);
         status.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
-        status.Text = "Drag videos or pictures here, or click Add files. Install app... sideloads apps.";
+        status.Text = "Drag videos or pictures here, or click Add files. Apps installs apps on the headset.";
 
         var via = new Label { AutoSize = true, ForeColor = SystemColors.GrayText, Location = new Point(12, 609),
             Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
@@ -260,12 +261,12 @@ class UploadForm : Form
         addButton.Location = new Point(518, 602);
         addButton.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
         addButton.Click += delegate { PickFiles(); };
-        installButton.Text = "Install app...";
+        installButton.Text = "Apps...";
         installButton.Size = new Size(110, 28);
         installButton.Location = new Point(404, 602);
         installButton.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
-        installButton.Click += delegate { PickApps(); };
-        tips.SetToolTip(installButton, "Sideload apps: .apk, .exe and AppImage go to ~/Applications and into the Steam library; Flatpak bundles and .flatpakref files install with Flatpak.");
+        installButton.Click += delegate { ShowAppsMenu(); };
+        tips.SetToolTip(installButton, "Install apps on the headset, or see and uninstall them. Sideloading: .apk, .exe and AppImage go to ~/Applications and into the Steam library; Flatpak bundles and .flatpakref files install with Flatpak.");
 
         fileBar.Maximum = totalBar.Maximum = 1000;
         Controls.AddRange(new Control[] { connectButton, ipButton, connLabel, dest, pathBox, places, upButton, hiddenBox,
@@ -299,6 +300,116 @@ class UploadForm : Form
             Filter = "Apps|*.apk;*.exe;*.appimage;*.flatpak;*.flatpakref|All files|*.*" })
         {
             if (dlg.ShowDialog(this) == DialogResult.OK) InstallApps(dlg.FileNames);
+        }
+    }
+
+    // Apps... menu: install, or see and remove what is installed.
+    void ShowAppsMenu()
+    {
+        var menu = new ContextMenuStrip();
+        menu.Items.Add("Install app...", null, delegate { PickApps(); });
+        menu.Items.Add("Manage installed apps...", null, delegate { ManageApps(); });
+        menu.Show(installButton, new Point(0, installButton.Height));
+    }
+
+    // The sideloaded apps: files in ~/Applications, and the Flatpak apps
+    // installed for the user. Uninstall removes the file (or the Flatpak);
+    // the Steam library entry has to go from Steam itself, since Steam
+    // keeps its shortcuts in its own file and rewrites it while running.
+    void ManageApps()
+    {
+        using (var f = new Form { Text = "Installed apps", StartPosition = FormStartPosition.CenterParent, ShowInTaskbar = false,
+            MinimizeBox = false, ClientSize = new Size(520, 340), MinimumSize = new Size(420, 260), Font = Font })
+        {
+            var view = new ListView { View = View.Details, FullRowSelect = true, HideSelection = false,
+                Location = new Point(12, 12), Size = new Size(496, 248),
+                Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right };
+            view.Columns.Add("App", 250);
+            view.Columns.Add("Kind", 130);
+            view.Columns.Add("Size", 90, HorizontalAlignment.Right);
+            var info = new Label { Location = new Point(12, 266), Size = new Size(496, 34), ForeColor = SystemColors.GrayText,
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
+                Text = "Uninstalling removes the app from the headset. Its Steam library entry stays until you remove it in Steam (Manage > Remove non-Steam game)." };
+            var remove = new Button { Text = "Uninstall...", Size = new Size(90, 26), Location = new Point(256, 304), Anchor = AnchorStyles.Bottom | AnchorStyles.Right };
+            var refresh = new Button { Text = "Refresh", Size = new Size(75, 26), Location = new Point(352, 304), Anchor = AnchorStyles.Bottom | AnchorStyles.Right };
+            var close = new Button { Text = "Close", DialogResult = DialogResult.Cancel, Size = new Size(75, 26), Location = new Point(433, 304), Anchor = AnchorStyles.Bottom | AnchorStyles.Right };
+            f.Controls.AddRange(new Control[] { view, info, remove, refresh, close });
+            f.CancelButton = close;
+
+            MethodInvoker load = null;
+            load = delegate
+            {
+                view.Items.Clear();
+                view.Items.Add(new ListViewItem("Listing..."));
+                string host = hostName;
+                string cmd = "d=" + ShellPath(AppsDir) + "; [ -d \"$d\" ] && find \"$d\" -mindepth 1 -maxdepth 1 -type f ! -name '.*' -printf 'f\\t%f\\t%s\\n'"
+                    + "; command -v flatpak >/dev/null 2>&1 && flatpak list --user --app --columns=application,name 2>/dev/null | sed 's/^/p\\t/'; true";
+                new Thread(delegate ()
+                {
+                    string output;
+                    string error = RunRemote(cmd, host, 5, out output);
+                    UI(delegate
+                    {
+                        if (f.IsDisposed) return;
+                        view.Items.Clear();
+                        if (error != null) { view.Items.Add(new ListViewItem("Couldn't list the apps: " + error)); return; }
+                        foreach (var line in output.Replace("\r", "").Split('\n'))
+                        {
+                            var p = line.Split('\t');
+                            if (p.Length < 3) continue;
+                            ListViewItem item;
+                            if (p[0] == "f")
+                            {
+                                long size;
+                                long.TryParse(p[2], out size);
+                                string kind = AppKind(p[1]);
+                                item = new ListViewItem(new[] { p[1], kind == null ? "file" : kind == "apk" ? "Android (.apk)"
+                                    : kind == "exe" ? "Windows (.exe)" : kind == "appimage" ? "AppImage" : kind, Human(size) });
+                            }
+                            else if (p[0] == "p")
+                                item = new ListViewItem(new[] { p[2].Length > 0 ? p[2] : p[1], "Flatpak (" + p[1] + ")", "" });
+                            else continue;
+                            item.Tag = p;
+                            view.Items.Add(item);
+                        }
+                        if (view.Items.Count == 0) view.Items.Add(new ListViewItem("No sideloaded apps yet."));
+                    });
+                }) { IsBackground = true }.Start();
+            };
+            refresh.Click += delegate { load(); };
+            remove.Click += delegate
+            {
+                var picked = new List<string[]>();
+                foreach (ListViewItem it in view.SelectedItems) if (it.Tag is string[]) picked.Add((string[])it.Tag);
+                if (picked.Count == 0) { MessageBox.Show(f, "Select the apps to uninstall first.", Text); return; }
+                var names = new StringBuilder();
+                var cmd = new StringBuilder("r=0");
+                foreach (var p in picked)
+                {
+                    names.Append("\n  ").Append(p[0] == "p" && p[2].Length > 0 ? p[2] : p[1]);
+                    if (p[0] == "f") cmd.Append("; rm -f -- ").Append(ShellPath(Join(AppsDir, p[1]))).Append(" || r=1");
+                    else cmd.Append("; flatpak uninstall --user -y --noninteractive ").Append(Sh(p[1])).Append(" >/dev/null || r=1");
+                }
+                cmd.Append("; exit $r");
+                if (MessageBox.Show(f, "Uninstall from the headset:" + names + "\n\nRemove them from the Steam library yourself afterwards.",
+                    Text, MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) return;
+                remove.Enabled = false;
+                string host = hostName, c = cmd.ToString();
+                new Thread(delegate ()
+                {
+                    string output;
+                    string error = RunRemote(c, host, 10, out output);
+                    UI(delegate
+                    {
+                        if (f.IsDisposed) return;
+                        remove.Enabled = true;
+                        if (error != null) MessageBox.Show(f, "Not everything was uninstalled: " + error, Text);
+                        load();
+                    });
+                }) { IsBackground = true }.Start();
+            };
+            f.Shown += delegate { load(); };
+            f.ShowDialog(this);
         }
     }
 

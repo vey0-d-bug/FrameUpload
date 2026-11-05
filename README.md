@@ -21,9 +21,9 @@ It copies over ssh (the Frame has no SMB share), using the `frame` host entry in
 
 ## Install apps (v7)
 
-**Install app...** sideloads apps onto the headset; dropping only app files on the window asks whether to install them or just copy them.
+**Apps... > Install app...** sideloads apps onto the headset; dropping only app files on the window asks whether to install them or just copy them. **Apps... > Manage installed apps...** lists what is in `~/Applications` and the Flatpak apps installed for the user, and uninstalls the selected ones (their Steam library entry stays until you remove it in Steam: Manage > Remove non-Steam game).
 
-- `.apk`, Windows `.exe` and `.AppImage` files are copied to `~/Applications` and added to the Steam library with SteamOS's own `steamos-add-to-steam` (what Desktop mode's "Add to Steam" runs). AppImages are made executable first. Steam has to be running on the headset.
+- `.apk`, Windows `.exe` and `.AppImage` files are copied to `~/Applications` and added to the Steam library with SteamOS's own `steamos-add-to-steam` (what Desktop mode's "Add to Steam" runs). AppImages are made executable first. Steam has to be running on the headset. The headset's `steamos-add-to-steam` takes `.apk` and `.exe` files as they are, and AppImages once they are executable.
 - An `.exe` runs through Proton; if it doesn't start, set Properties > Compatibility to Proton in Steam.
 - `.flatpak` bundles and `.flatpakref` files are installed with `flatpak install --user`, and show up in the Desktop mode app menu. The copied file is removed afterwards.
 - What the headset says (added, installed, or why not) goes in the list under the file.
@@ -54,7 +54,7 @@ Measured on the test PC (2.5 GbE wired) to the Frame (5 GHz, 80 MHz), 1 GiB of r
 - `--sub=FOLDER`: start in `~/Videos/FOLDER`; `--dir=PATH`: start in any headset folder (`~/...` or `/...`).
 - `--ssh=PATH`: a specific `ssh.exe`.
 - `--log=FILE`: appends one tab-separated line per file (size, seconds, MB/s, streams, ssh, ok or the error).
-- `--install`: the files given are apps to install (as with **Install app...**).
+- `--install`: the files given are apps to install (as with **Apps... > Install app...**).
 - `--exit`: closes the window when the batch is done; the exit code is the number of failed files.
 
 ## Build
