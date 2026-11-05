@@ -19,6 +19,16 @@ It copies over ssh (the Frame has no SMB share), using the `frame` host entry in
 - **Connect to Frame** (also run when the window opens) tries the `frame` entry in `~/.ssh/config`, then the last IP that worked, then `frame.local`. If none answers, it asks for an IP. **Set IP...** asks straight away. The headset's address is saved in `%APPDATA%\FrameUpload\host.txt` whenever a connection works.
 - A fallback address replaces only the entry's `HostName` (`ssh -o HostName=IP frame`), so the entry's user and keys still apply, and copies go to whichever address connected. A new address's host key is accepted on first use (`StrictHostKeyChecking=accept-new`); a changed key is still refused.
 
+## Install apps (v7)
+
+**Apps... > Install app...** sideloads apps onto the headset; dropping only app files on the window asks whether to install them or just copy them. **Apps... > Manage installed apps...** lists what is in `~/Applications` and the Flatpak apps installed for the user, and uninstalls the selected ones (their Steam library entry stays until you remove it in Steam: Manage > Remove non-Steam game).
+
+- `.apk`, Windows `.exe` and `.AppImage` files are copied to `~/Applications` and added to the Steam library with SteamOS's own `steamos-add-to-steam` (what Desktop mode's "Add to Steam" runs). AppImages are made executable first. Steam has to be running on the headset. The headset's `steamos-add-to-steam` takes `.apk` and `.exe` files as they are, and AppImages once they are executable.
+- An `.exe` runs through Proton; if it doesn't start, set Properties > Compatibility to Proton in Steam.
+- `.flatpak` bundles and `.flatpakref` files are installed with `flatpak install --user`, and show up in the Desktop mode app menu. The headset comes with no Flatpak remotes, so the first install adds Flathub for the user, where the app's runtime comes from; runtimes can take a GB or more of the home folder. The copied file is removed afterwards.
+- What the headset says (added, installed, or why not) goes in the list under the file.
+- `tools/probe-sideload.cmd` runs a read-only survey of how the headset installs apps and saves it to `probe-sideload.txt`, for when an install doesn't work.
+
 ## Speed (v2)
 
 Windows' built-in `ssh.exe` (OpenSSH for Windows 9.5) is the bottleneck: it tops out at 12-15 MB/s, while the link to the Frame does about 55 MB/s on one TCP stream and 70 on several, and the headset's disk writes at 2 GB/s. So v2:
@@ -38,12 +48,13 @@ Measured on the test PC (2.5 GbE wired) to the Frame (5 GHz, 80 MHz), 1 GiB of r
 
 ## Command line
 
-`FrameUpload.exe [--host=NAME] [--sub=FOLDER | --dir=PATH] [--streams=N] [--ssh=PATH] [--log=FILE] [--exit] [FILE...]`
+`FrameUpload.exe [--host=NAME] [--sub=FOLDER | --dir=PATH] [--streams=N] [--ssh=PATH] [--log=FILE] [--exit] [--install] [FILE...]`
 
 - `--streams=N`: ranges per big file (1-16; 1 = v1's single stream).
 - `--sub=FOLDER`: start in `~/Videos/FOLDER`; `--dir=PATH`: start in any headset folder (`~/...` or `/...`).
 - `--ssh=PATH`: a specific `ssh.exe`.
 - `--log=FILE`: appends one tab-separated line per file (size, seconds, MB/s, streams, ssh, ok or the error).
+- `--install`: the files given are apps to install (as with **Apps... > Install app...**).
 - `--exit`: closes the window when the batch is done; the exit code is the number of failed files.
 
 ## Build

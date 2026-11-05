@@ -1,5 +1,15 @@
 # FrameUpload patch notes
 
+## v7 (2026-11-05)
+
+**Install apps**
+- New **Apps...** button. **Install app...** sideloads apps. `.apk`, Windows `.exe` and `.AppImage` files go to `~/Applications` on the headset and into the Steam library; Flatpak bundles (`.flatpak`) and `.flatpakref` files install with Flatpak.
+- Dropping only app files on the window asks whether to install them or just copy them into the folder on show.
+- The list shows "installed" for each app and what the headset said; an app that couldn't be added (for example with Steam not running) stays in `~/Applications` and says why.
+- **Manage installed apps...** lists the apps in `~/Applications` and the Flatpak apps installed for the user, and uninstalls the selected ones after a confirmation. The Steam library entry stays until you remove it in Steam.
+- New `--install` option: the files given on the command line are installed as apps.
+- New `tools/probe-sideload.cmd`: a read-only survey of how the headset installs apps.
+
 ## v6 (2026-10-31)
 
 **Whole-headset file browser**
