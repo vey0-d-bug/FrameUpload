@@ -1,6 +1,6 @@
 # FrameUpload patch notes
 
-## v7 (unreleased)
+## v7 (2026-11-05)
 
 **Install apps**
 - New **Apps...** button. **Install app...** sideloads apps. `.apk`, Windows `.exe` and `.AppImage` files go to `~/Applications` on the headset and into the Steam library; Flatpak bundles (`.flatpak`) and `.flatpakref` files install with Flatpak.
