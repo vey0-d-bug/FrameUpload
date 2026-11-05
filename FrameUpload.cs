@@ -505,6 +505,10 @@ case $k in
   flatpak|flatpakref)
     command -v flatpak >/dev/null 2>&1 || { echo 'Flatpak is not on the headset.' >&2; exit 1; }
     if [ $k = flatpak ]; then o=--bundle; else o=--from; fi
+    # The headset ships with no Flatpak remotes, and an app needs its
+    # runtime from one: add Flathub for this user (a .flatpakref names its
+    # own, which flatpak adds by itself).
+    flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo >/dev/null 2>&1
     out=$(flatpak install --user -y --noninteractive $o ""$f"" 2>&1); r=$?
     rm -f ""$f""
     if [ $r = 0 ]; then echo 'Installed with Flatpak: it is in the Desktop mode app menu.'

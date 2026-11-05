@@ -25,7 +25,7 @@ It copies over ssh (the Frame has no SMB share), using the `frame` host entry in
 
 - `.apk`, Windows `.exe` and `.AppImage` files are copied to `~/Applications` and added to the Steam library with SteamOS's own `steamos-add-to-steam` (what Desktop mode's "Add to Steam" runs). AppImages are made executable first. Steam has to be running on the headset. The headset's `steamos-add-to-steam` takes `.apk` and `.exe` files as they are, and AppImages once they are executable.
 - An `.exe` runs through Proton; if it doesn't start, set Properties > Compatibility to Proton in Steam.
-- `.flatpak` bundles and `.flatpakref` files are installed with `flatpak install --user`, and show up in the Desktop mode app menu. The copied file is removed afterwards.
+- `.flatpak` bundles and `.flatpakref` files are installed with `flatpak install --user`, and show up in the Desktop mode app menu. The headset comes with no Flatpak remotes, so the first install adds Flathub for the user, where the app's runtime comes from; runtimes can take a GB or more of the home folder. The copied file is removed afterwards.
 - What the headset says (added, installed, or why not) goes in the list under the file.
 - `tools/probe-sideload.cmd` runs a read-only survey of how the headset installs apps and saves it to `probe-sideload.txt`, for when an install doesn't work.
 
