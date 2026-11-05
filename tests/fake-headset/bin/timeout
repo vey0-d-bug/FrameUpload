@@ -1,0 +1,6 @@
+#!/bin/bash
+# Git for Windows may not ship timeout: run the command without one then.
+if [ -x /usr/bin/timeout ]; then exec /usr/bin/timeout "$@"; fi
+while [ "${1#-}" != "$1" ]; do shift; done
+shift
+exec "$@"

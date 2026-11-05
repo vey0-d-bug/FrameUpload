@@ -1,0 +1,32 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build FrameUpload.exe
+        shell: cmd
+        run: build.cmd "%RUNNER_TEMP%\build"
+      - name: Run the tests against a fake headset
+        shell: powershell
+        run: tests\run-tests.ps1 -Exe "$env:RUNNER_TEMP\build\FrameUpload.exe" -Keep -WorkDir "$env:RUNNER_TEMP"
+      - name: Keep the fake headsets and logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-work
+          path: ${{ runner.temp }}\FrameUpload-tests-*
+          if-no-files-found: ignore
+      - name: Keep the build
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: FrameUpload
+          path: ${{ runner.temp }}\build\FrameUpload.exe

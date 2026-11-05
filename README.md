@@ -57,6 +57,8 @@ Measured on the test PC (2.5 GbE wired) to the Frame (5 GHz, 80 MHz), 1 GiB of r
 - `--install`: the files given are apps to install (as with **Apps... > Install app...**).
 - `--exit`: closes the window when the batch is done; the exit code is the number of failed files.
 
-## Build
+## Build and test
 
 Run `build.cmd` (or `build.cmd OUTPUT_FOLDER`). It uses the .NET Framework `csc.exe` that ships with Windows (no SDK needed) and writes `FrameUpload.exe` next to the script by default.
+
+`tests\run-tests.cmd` runs the automated tests against a fake headset, no headset needed (they also run on GitHub for every push), and `tests\smoke-headset.cmd` checks a build on the real headset. See [tests/README.md](tests/README.md).
