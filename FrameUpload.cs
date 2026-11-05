@@ -16,6 +16,9 @@
 // path box, Places, hidden files), copies go to the folder on show, and
 // Download... copies headset files and folders back to the PC. Delete and
 // rename stay inside the home folder and removable drives.
+// v7: Install app... sideloads apps: .apk, Windows .exe and AppImage files
+// are copied to ~/Applications and added to the Steam library; Flatpak
+// bundles and .flatpakref files are installed with flatpak --user.
 // Build: build.cmd (uses the .NET Framework csc.exe that ships with Windows).
 using System;
 using System.Collections.Generic;
@@ -32,6 +35,7 @@ class Options
     public string Host = "frame", Sub = "", Dir, Ssh, Log;
     public int Streams;   // 0: the default for the ssh in use
     public bool Exit;     // close when the batch is done (scripted runs)
+    public bool Install;  // the files given are apps to install (v7)
     public readonly List<string> Files = new List<string>();
 }
 
@@ -44,7 +48,7 @@ static class Program
         Application.SetCompatibleTextRenderingDefault(false);
         // Optional: --host=NAME --sub=FOLDER (under ~/Videos) --dir=PATH (any
         // headset folder, ~/... or /...) --streams=N --ssh=PATH\ssh.exe
-        // --log=FILE --exit FILE... (files passed in, e.g. by dropping them on
+        // --log=FILE --exit --install (the files are apps) FILE... (files passed in, e.g. by dropping them on
         // the exe icon, start copying right away).
         var o = new Options();
         foreach (var a in args)
@@ -56,6 +60,7 @@ static class Program
             else if (a.StartsWith("--ssh=")) o.Ssh = a.Substring(6);
             else if (a.StartsWith("--log=")) o.Log = a.Substring(6);
             else if (a == "--exit") o.Exit = true;
+            else if (a == "--install") o.Install = true;
             else o.Files.Add(a);
         }
         var form = new UploadForm(o);
@@ -84,6 +89,7 @@ class UploadForm : Form
     readonly ProgressBar totalBar = new ProgressBar();
     readonly Label status = new Label();
     readonly Button addButton = new Button();
+    readonly Button installButton = new Button();
     readonly Button connectButton = new Button();
     readonly Button ipButton = new Button();
     readonly Label connLabel = new Label();
@@ -112,7 +118,7 @@ class UploadForm : Form
     volatile string currentPart;   // the .part being written, for a quit mid-copy
     volatile string currentLocalPart; // same for a download, on the PC
     readonly List<Process> live = new List<Process>();
-    int doneCount, failCount, skipCount;
+    int doneCount, failCount, skipCount, installCount;
     long batchBytes, batchSent;
 
     public int FailCount { get { return failCount; } }
@@ -126,7 +132,7 @@ class UploadForm : Form
         streams = o.Streams > 0 ? Math.Min(o.Streams, 16) : (gitSsh ? 6 : 8);
         string sub = o.Sub.Trim().Replace('\\', '/').Trim('/');
         pathBox.Text = !string.IsNullOrEmpty(o.Dir) ? o.Dir : "~/Videos" + (sub.Length > 0 ? "/" + sub : "");
-        if (o.Files.Count > 0) Shown += delegate { Enqueue(o.Files.ToArray()); };
+        if (o.Files.Count > 0) Shown += delegate { if (o.Install) InstallApps(o.Files.ToArray()); else Enqueue(o.Files.ToArray()); };
         Text = "Frame Upload";
         ClientSize = new Size(640, 640);
         MinimumSize = new Size(600, 480);
@@ -242,7 +248,7 @@ class UploadForm : Form
         status.Location = new Point(12, 564);
         status.Size = new Size(616, 34);
         status.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
-        status.Text = "Drag videos or pictures here, or click Add files.";
+        status.Text = "Drag videos or pictures here, or click Add files. Install app... sideloads apps.";
 
         var via = new Label { AutoSize = true, ForeColor = SystemColors.GrayText, Location = new Point(12, 609),
             Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
@@ -254,14 +260,20 @@ class UploadForm : Form
         addButton.Location = new Point(518, 602);
         addButton.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
         addButton.Click += delegate { PickFiles(); };
+        installButton.Text = "Install app...";
+        installButton.Size = new Size(110, 28);
+        installButton.Location = new Point(404, 602);
+        installButton.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
+        installButton.Click += delegate { PickApps(); };
+        tips.SetToolTip(installButton, "Sideload apps: .apk, .exe and AppImage go to ~/Applications and into the Steam library; Flatpak bundles and .flatpakref files install with Flatpak.");
 
         fileBar.Maximum = totalBar.Maximum = 1000;
         Controls.AddRange(new Control[] { connectButton, ipButton, connLabel, dest, pathBox, places, upButton, hiddenBox,
-            refreshButton, newFolderButton, renameButton, deleteButton, downloadButton, split, fileBar, totalBar, status, via, addButton });
+            refreshButton, newFolderButton, renameButton, deleteButton, downloadButton, split, fileBar, totalBar, status, via, installButton, addButton });
         Shown += delegate { Connect(null, false); };
 
         DragEnter += (s, e) => e.Effect = e.Data.GetDataPresent(DataFormats.FileDrop) ? DragDropEffects.Copy : DragDropEffects.None;
-        DragDrop += (s, e) => Enqueue((string[])e.Data.GetData(DataFormats.FileDrop));
+        DragDrop += (s, e) => Dropped((string[])e.Data.GetData(DataFormats.FileDrop));
         FormClosing += (s, e) =>
         {
             if (busy && e.CloseReason == CloseReason.UserClosing &&
@@ -281,11 +293,137 @@ class UploadForm : Form
         }
     }
 
+    void PickApps()
+    {
+        using (var dlg = new OpenFileDialog { Multiselect = true, Title = "Pick apps to install on the headset",
+            Filter = "Apps|*.apk;*.exe;*.appimage;*.flatpak;*.flatpakref|All files|*.*" })
+        {
+            if (dlg.ShowDialog(this) == DialogResult.OK) InstallApps(dlg.FileNames);
+        }
+    }
+
+    // Dropped files that are all apps can be installed instead of copied.
+    void Dropped(string[] paths)
+    {
+        bool allApps = paths.Length > 0;
+        foreach (var p in paths) if (!File.Exists(p) || AppKind(p) == null) allApps = false;
+        if (allApps)
+        {
+            var answer = MessageBox.Show(this, "Install " + (paths.Length == 1 ? "\"" + Path.GetFileName(paths[0]) + "\"" : paths.Length + " apps")
+                + " on the headset?\n\nYes: install (into ~/Applications and the Steam library, or with Flatpak).\nNo: just copy the file(s) into the folder on show.",
+                Text, MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+            if (answer == DialogResult.Cancel) return;
+            if (answer == DialogResult.Yes) { InstallApps(paths); return; }
+        }
+        Enqueue(paths);
+    }
+
+    // The kind of app a file is, by its extension; null: not one we install.
+    static string AppKind(string path)
+    {
+        switch (Path.GetExtension(path).ToLowerInvariant())
+        {
+            case ".apk": return "apk";
+            case ".exe": return "exe";
+            case ".appimage": return "appimage";
+            case ".flatpak": return "flatpak";
+            case ".flatpakref": return "flatpakref";
+            default: return null;
+        }
+    }
+
+    // Where installed apps live on the headset (the usual home of AppImages).
+    const string AppsDir = "~/Applications";
+
+    void InstallApps(string[] paths)
+    {
+        var jobs = new List<Job>();
+        var notApps = new List<string>();
+        foreach (var p in paths)
+        {
+            if (!File.Exists(p)) continue;
+            string kind = AppKind(p);
+            if (kind == null) { notApps.Add(Path.GetFileName(p)); continue; }
+            jobs.Add(new Job { Local = p, Dir = AppsDir, Label = Path.GetFileName(p), Size = new FileInfo(p).Length, Install = kind });
+        }
+        if (notApps.Count > 0)
+            MessageBox.Show(this, "Not an app FrameUpload can install (.apk, .exe, .AppImage, .flatpak, .flatpakref), left out:\n\n"
+                + string.Join("\n", notApps.ToArray()), Text);
+        if (Enqueue(jobs) == 0)
+        {
+            status.Text = "Nothing to install.";
+            if (opt.Exit && !busy) Close();
+        }
+    }
+
+    // Runs on the headset as: bash -c SCRIPT _ KIND FILE. Steam needs the
+    // desktop session's display, which an ssh login doesn't have, so the
+    // script borrows it. Adding to Steam uses SteamOS's own
+    // steamos-add-to-steam (what Desktop mode's "Add to Steam" runs); without
+    // it, the same steam://addnonsteamgame link goes to Steam directly.
+    const string InstallScript = @"
+k=$1; f=$2
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+export DISPLAY=${DISPLAY:-:0}
+if [ -z ""${WAYLAND_DISPLAY:-}"" ]; then
+  for w in ""$XDG_RUNTIME_DIR""/wayland-*; do
+    case $w in *.lock) ;; *) [ -S ""$w"" ] && export WAYLAND_DISPLAY=${w##*/} && break ;; esac
+  done
+fi
+to_steam() {
+  { kill -0 ""$(cat ~/.steam/steam.pid 2>/dev/null)"" 2>/dev/null || pgrep -x steam >/dev/null 2>&1; } || { echo 'Steam is not running on the headset, so the app was copied but not added to the library.' >&2; return 1; }
+  if command -v steamos-add-to-steam >/dev/null 2>&1; then
+    timeout 30 steamos-add-to-steam ""$1"" </dev/null >/dev/null || return 1
+  else
+    u=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""""))' ""$1"") || return 1
+    touch /tmp/addnonsteamgamefile
+    if command -v xdg-open >/dev/null 2>&1; then timeout 30 xdg-open ""steam://addnonsteamgame/$u"" </dev/null >/dev/null 2>&1 &
+    else timeout 30 steam ""steam://addnonsteamgame/$u"" </dev/null >/dev/null 2>&1 &
+    fi
+    sleep 3
+  fi
+  echo 'Added to the Steam library.'
+}
+case $k in
+  apk)
+    to_steam ""$f"" ;;
+  exe)
+    to_steam ""$f"" && echo 'If it does not start, set Properties > Compatibility to Proton in Steam.' ;;
+  appimage)
+    chmod +x ""$f"" && to_steam ""$f"" ;;
+  flatpak|flatpakref)
+    command -v flatpak >/dev/null 2>&1 || { echo 'Flatpak is not on the headset.' >&2; exit 1; }
+    if [ $k = flatpak ]; then o=--bundle; else o=--from; fi
+    out=$(flatpak install --user -y --noninteractive $o ""$f"" 2>&1); r=$?
+    rm -f ""$f""
+    if [ $r = 0 ]; then echo 'Installed with Flatpak: it is in the Desktop mode app menu.'
+    else printf '%s\n' ""$out"" | tail -n 3 >&2; fi
+    exit $r ;;
+  *) echo ""unknown app kind $k"" >&2; exit 1 ;;
+esac
+";
+
+    // After the copy: installs the app; null when it worked. What the
+    // headset printed goes in the list.
+    string Install(Job job)
+    {
+        string output;
+        string error = RunRemote("bash -c " + Sh(InstallScript.Replace("\r", "")) + " _ " + job.Install + " "
+            + ShellPath(Join(job.Dir, job.Label)), hostName, 10, out output);
+        foreach (var line in output.Replace("\r", "").Split('\n'))
+        {
+            string l = line.Trim();
+            if (l.Length > 0) UI(delegate { list.Items.Add("    " + l); });
+        }
+        return error;
+    }
+
     // One file to copy: PC -> headset (Dir: the headset folder), or with
     // Down set, headset -> PC (Remote: the headset file, Local: where it goes).
     class Job
     {
         public bool Down;
+        public string Install; // set: an app of this kind (AppKind) to install once copied
         public string Local, Dir, Remote, Label;
         public long Size;
     }
@@ -315,7 +453,7 @@ class UploadForm : Form
     {
         lock (queueLock)
         {
-            if (!busy) { doneCount = failCount = skipCount = 0; batchBytes = batchSent = 0; }
+            if (!busy) { doneCount = failCount = skipCount = installCount = 0; batchBytes = batchSent = 0; }
             foreach (var j in jobs)
             {
                 queue.Enqueue(j);
@@ -346,13 +484,24 @@ class UploadForm : Form
             string error = null;
             var watch = Stopwatch.StartNew();
             int used = 1;
-            try { error = job.Down ? Download(job) : Copy(job.Local, job.Dir, job.Label, job.Size, out used); }
+            try
+            {
+                error = job.Down ? Download(job) : Copy(job.Local, job.Dir, job.Label, job.Size, out used);
+                if (error == null && job.Install != null)
+                {
+                    string name = job.Label;
+                    UI(delegate { MarkItem(name, "installing"); status.Text = "Installing " + name + "..."; });
+                    error = Install(job);
+                    if (error == null) installCount++;
+                }
+            }
             catch (Exception ex) { error = ex.Message; }
             if (error == null) doneCount++; else if (error == Skipped) skipCount++; else failCount++;
-            if (!job.Down && InVideos(job.Dir)) toVideos = true;
+            if (!job.Down && job.Install == null && InVideos(job.Dir)) toVideos = true;
             Log(job.Label, job.Size, watch.Elapsed.TotalSeconds, used, error);
             string label = job.Label;
-            UI(delegate { MarkItem(label, error == null ? "copied    " : error == Skipped ? "skipped   " : "FAILED    "); });
+            string okTag = job.Install != null ? "installed " : "copied    ";
+            UI(delegate { MarkItem(label, error == null ? okTag : error == Skipped ? "skipped   " : "FAILED    "); });
             if (error != null && error != Skipped) UI(delegate { list.Items.Add("    " + error); });
         }
         UI(delegate
@@ -360,8 +509,9 @@ class UploadForm : Form
             fileBar.Value = 0;
             totalBar.Value = failCount == 0 ? 1000 : totalBar.Value;
             string skipped = skipCount > 0 ? " " + skipCount + " already on the PC, left as they were." : "";
+            string apps = installCount > 0 ? " " + installCount + " app(s) installed: look in the Steam library." : "";
             status.Text = failCount == 0
-                ? "Done: " + doneCount + " file(s) copied." + skipped + (toVideos ? " They show up in FrameCinema's Library." : "")
+                ? "Done: " + doneCount + " file(s) copied." + skipped + apps + (toVideos ? " They show up in FrameCinema's Library." : "")
                 : "Finished with errors: " + doneCount + " copied, " + failCount + " failed (see list)." + skipped;
             if (opt.Exit) { Close(); return; }
             ListFolder();
@@ -1382,7 +1532,7 @@ class UploadForm : Form
         for (int i = 0; i < list.Items.Count; i++)
         {
             string s = (string)list.Items[i];
-            if (s == "waiting   " + name) { list.Items[i] = tag + name; return; }
+            if (s == "waiting   " + name || s == "installing" + name) { list.Items[i] = tag + name; return; }
         }
     }
 
