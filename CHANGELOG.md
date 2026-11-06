@@ -1,5 +1,14 @@
 # FrameUpload patch notes
 
+## v8 (2026-11-06)
+
+**Not just for videos**
+- **Add files...** shows all files to start with; "Videos and pictures" and "Apps" are still in the file type list.
+- The window opens in the headset folder you used last time (saved in `%APPDATA%\FrameUpload\folder.txt`), and in `~/Videos` the first time.
+- **Places** adds Documents, Pictures, Music and Applications (where sideloaded apps go), and lists Home first.
+- The delete confirmation only warns about folders outside your own files (Videos, Pictures, Music, Documents, Downloads, Desktop, and SD cards / USB drives), instead of everything outside `~/Videos`.
+- Wording in the window and the README no longer says the tool is for videos and pictures.
+
 ## v7 (2026-11-05)
 
 **Install apps**
