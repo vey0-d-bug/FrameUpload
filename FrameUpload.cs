@@ -1,5 +1,5 @@
-// FrameUpload: copy videos/pictures from this PC to the Steam Frame's ~/Videos
-// over ssh (the headset has no SMB share), using the "frame" host entry in
+// FrameUpload: copy files between this PC and the Steam Frame, browse the
+// headset's files and sideload apps, over ssh (the headset has no SMB share), using the "frame" host entry in
 // %USERPROFILE%\.ssh\config.
 // v2: Windows' built-in ssh.exe (OpenSSH for Windows 9.5) tops out at about
 // 12-15 MB/s on its own, while the link does 55 MB/s on one TCP stream and
@@ -20,6 +20,9 @@
 // are copied to ~/Applications and added to the Steam library; Flatpak
 // bundles and .flatpakref files are installed with flatpak --user.
 // Apps > Manage installed apps... lists them and uninstalls them.
+// v8: not just for videos: Add files... picks any file, the window opens in
+// the folder used last time (~/Videos the first time), and Places has
+// Documents, Pictures, Music and Applications.
 // Build: build.cmd (uses the .NET Framework csc.exe that ships with Windows).
 using System;
 using System.Collections.Generic;
@@ -132,7 +135,7 @@ class UploadForm : Form
         // MB/s, 4 streams 62, 8 streams 69; Windows' ssh 12-15 per stream.
         streams = o.Streams > 0 ? Math.Min(o.Streams, 16) : (gitSsh ? 6 : 8);
         string sub = o.Sub.Trim().Replace('\\', '/').Trim('/');
-        pathBox.Text = !string.IsNullOrEmpty(o.Dir) ? o.Dir : "~/Videos" + (sub.Length > 0 ? "/" + sub : "");
+        pathBox.Text = !string.IsNullOrEmpty(o.Dir) ? o.Dir : sub.Length > 0 ? "~/Videos/" + sub : StartFolder();
         if (o.Files.Count > 0) Shown += delegate { if (o.Install) InstallApps(o.Files.ToArray()); else Enqueue(o.Files.ToArray()); };
         Text = "Frame Upload";
         ClientSize = new Size(640, 640);
@@ -163,7 +166,7 @@ class UploadForm : Form
         pathBox.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; ListFolder(); } };
         tips.SetToolTip(pathBox, "A headset folder: ~/... (home), /... (anywhere), or a name inside the folder on show. Enter opens it.");
         places.DropDownStyle = ComboBoxStyle.DropDownList;
-        places.Items.AddRange(new object[] { "Places...", "Videos", "Home", "Downloads", "SD card / USB", "Whole headset (/)" });
+        places.Items.AddRange(new object[] { "Places...", "Home", "Downloads", "Documents", "Pictures", "Videos", "Music", "Applications", "SD card / USB", "Whole headset (/)" });
         places.SelectedIndex = 0;
         places.Size = new Size(140, 26);
         places.Location = new Point(420, 50);
@@ -249,7 +252,7 @@ class UploadForm : Form
         status.Location = new Point(12, 564);
         status.Size = new Size(616, 34);
         status.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
-        status.Text = "Drag videos or pictures here, or click Add files. Apps installs apps on the headset.";
+        status.Text = "Drag files here, or click Add files. Apps installs apps on the headset.";
 
         var via = new Label { AutoSize = true, ForeColor = SystemColors.GrayText, Location = new Point(12, 609),
             Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
@@ -287,8 +290,8 @@ class UploadForm : Form
 
     void PickFiles()
     {
-        using (var dlg = new OpenFileDialog { Multiselect = true, Title = "Pick videos or pictures",
-            Filter = "Videos and pictures|*.mp4;*.mkv;*.mov;*.webm;*.avi;*.m4v;*.ts;*.jpg;*.jpeg;*.png;*.webp;*.heic|All files|*.*" })
+        using (var dlg = new OpenFileDialog { Multiselect = true, Title = "Pick files to copy to the headset",
+            Filter = "All files|*.*|Videos and pictures|*.mp4;*.mkv;*.mov;*.webm;*.avi;*.m4v;*.ts;*.jpg;*.jpeg;*.png;*.webp;*.heic|Apps|*.apk;*.exe;*.appimage;*.flatpak;*.flatpakref" })
         {
             if (dlg.ShowDialog(this) == DialogResult.OK) Enqueue(dlg.FileNames);
         }
@@ -1017,6 +1020,26 @@ esac
         catch (Exception) { } // only a convenience for next time
     }
 
+    // The headset folder on show when the window last listed one, so it opens
+    // there next time; ~/Videos the first time.
+    static string SavedFolderFile
+    {
+        get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), @"FrameUpload\folder.txt"); }
+    }
+
+    static string StartFolder()
+    {
+        string f = "";
+        try { f = File.ReadAllText(SavedFolderFile).Trim(); } catch (Exception) { }
+        return f == "~" || f.StartsWith("~/") || f.StartsWith("/") ? f : "~/Videos";
+    }
+
+    static void SaveFolder(string p)
+    {
+        try { Directory.CreateDirectory(Path.GetDirectoryName(SavedFolderFile)); File.WriteAllText(SavedFolderFile, p); }
+        catch (Exception) { } // only a convenience for next time
+    }
+
     // Host names and IPs only: it goes on ssh's command line.
     static bool ValidHost(string h)
     {
@@ -1196,6 +1219,15 @@ esac
 
     static bool InVideos(string p) { return p == "~/Videos" || p.StartsWith("~/Videos/"); }
 
+    // The everyday folders for your own files, and SD cards and USB drives:
+    // deleting there needs no extra warning.
+    static bool InUserFiles(string p)
+    {
+        foreach (var d in new[] { "~/Videos", "~/Pictures", "~/Music", "~/Documents", "~/Downloads", "~/Desktop" })
+            if (p == d || p.StartsWith(d + "/")) return true;
+        return p.StartsWith("/run/media/");
+    }
+
     // Where delete and rename work: the home folder, and SD cards and USB
     // drives (SteamOS mounts them under /run/media). Elsewhere the system's
     // own files are read-only to this user anyway, or not ours to remove.
@@ -1339,6 +1371,7 @@ esac
         }
         else
         {
+            if (!opt.Exit) SaveFolder(p);
             var lines = output.Replace("\r", "").Split('\n');
             var folders = new List<ListViewItem>();
             var files = new List<ListViewItem>();
@@ -1413,7 +1446,7 @@ esac
         int i = places.SelectedIndex;
         if (i <= 0) return;
         places.SelectedIndex = 0; // back to "Places...", so the same place can be picked again
-        ListPath(new[] { null, "~/Videos", "~", "~/Downloads", "/run/media", "/" }[i]);
+        ListPath(new[] { null, "~", "~/Downloads", "~/Documents", "~/Pictures", "~/Videos", "~/Music", "~/Applications", "/run/media", "/" }[i]);
     }
 
     List<Entry> SelectedEntries()
@@ -1476,7 +1509,7 @@ esac
         if (MessageBox.Show(this, "Delete " + (entries.Count == 1 ? "this" : "these " + entries.Count) + " from the headset's "
                 + dir + "?\n\n" + names
                 + (anyDir ? "\nFolders are deleted with everything in them." : "")
-                + (InVideos(dir) ? "" : "\nThis is outside ~/Videos: be sure nothing on the headset needs it.")
+                + (InUserFiles(dir) ? "" : "\nThis is outside your own files (Videos, Pictures, Documents and so on): be sure nothing on the headset needs it.")
                 + "\nThis can't be undone.",
                 Text, MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
             return;
