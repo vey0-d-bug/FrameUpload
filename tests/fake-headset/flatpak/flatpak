@@ -1,0 +1,28 @@
+#!/bin/bash
+# Stand-in for flatpak. Records each call in $FAKE_STATE/flatpak.txt; the
+# installed user apps are the lines (ID<TAB>Name) of $FAKE_STATE/flatpak-apps.txt.
+# Switch: $FAKE_STATE/flatpak-fails makes install fail as flatpak does.
+printf '%s\n' "$*" >> "$FAKE_STATE/flatpak.txt"
+apps=$FAKE_STATE/flatpak-apps.txt
+tab=$'\t'
+case $1 in
+  remote-add) exit 0 ;;
+  install)
+    if [ -e "$FAKE_STATE/flatpak-fails" ]; then
+      echo 'Looking for matches...'
+      echo 'Required runtime for org.example.App/aarch64/stable (runtime/org.freedesktop.Platform/aarch64/24.08) found in remote flathub'
+      echo 'error: Failed to install org.freedesktop.Platform: No space left on device' >&2
+      exit 1
+    fi
+    for f; do :; done
+    [ -e "$f" ] || { echo "error: $f: no such file" >&2; exit 1; }
+    echo 'Installation complete.' ;;
+  list)
+    [ -e "$apps" ] && cat "$apps"
+    exit 0 ;;
+  uninstall)
+    for id; do :; done
+    grep -q "^$id$tab" "$apps" 2>/dev/null || { echo "error: $id not installed" >&2; exit 1; }
+    grep -v "^$id$tab" "$apps" > "$apps.new"; mv -f "$apps.new" "$apps" ;;
+  *) echo "fake flatpak: $1 isn't faked" >&2; exit 1 ;;
+esac

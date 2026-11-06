@@ -8,6 +8,7 @@
 - The list shows "installed" for each app and what the headset said; an app that couldn't be added (for example with Steam not running) stays in `~/Applications` and says why.
 - **Manage installed apps...** lists the apps in `~/Applications` and the Flatpak apps installed for the user, and uninstalls the selected ones after a confirmation. The Steam library entry stays until you remove it in Steam.
 - New `--install` option: the files given on the command line are installed as apps.
+- New automated tests (`tests\run-tests.cmd`) run FrameUpload against a fake headset on every push, and `tests\smoke-headset.cmd` checks a build on the real headset.
 - New `tools/probe-sideload.cmd`: a read-only survey of how the headset installs apps.
 
 ## v6 (2026-10-31)
