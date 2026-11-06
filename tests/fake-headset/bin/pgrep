@@ -1,0 +1,4 @@
+#!/bin/bash
+# Stand-in for pgrep: "steam" is running when $FAKE_STATE/steam-running exists.
+for a; do last=$a; done
+[ "$last" = steam ] && [ -e "$FAKE_STATE/steam-running" ]
